@@ -1,0 +1,14 @@
+{
+  "name": "playwright-runner",
+  "version": "0.1.0",
+  "description": "Automação do CV Agent",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "install:browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}
