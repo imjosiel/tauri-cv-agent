@@ -41,3 +41,6 @@ playwright/node_modules/
 # Optional caches
 .cache/
 playwright/.cache/
+
+# Generated Tauri schemas
+src-tauri/gen/
