@@ -1,12 +1,12 @@
 // playwright/src/sites/linkedin.js
 import { humanDelay, humanClick, waitForVisible, uploadFile, randomBetween } from "../utils.js";
-import { checkCaptcha } from "../captcha.js";
+import { checkCaptcha, handleCaptcha } from "../captcha.js";
 
 const uid = () => crypto.randomUUID().slice(0, 8);
 
 const BASE_URL = "https://www.linkedin.com";
 
-export async function searchLinkedIn(page, query, emit) {
+export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
 
   const encoded = encodeURIComponent(query);
@@ -22,9 +22,10 @@ export async function searchLinkedIn(page, query, emit) {
     const currentUrl = page.url();
     if (currentUrl.includes("checkpoint") || currentUrl.includes("challenge")) {
       emit("captcha_detected", { site: "linkedin", url: currentUrl });
-      emit("progress", { message: "LinkedIn: aguardando resolução de desafio..." });
-      // Espera até 60s para o usuário resolver manualmente
-      await page.waitForURL(/linkedin\.com\/jobs/, { timeout: 60000 }).catch(() => {});
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
+        return jobs;
+      }
+      emit("progress", { message: "LinkedIn: CAPTCHA resolvido. Retomando busca..." });
     }
 
     if (currentUrl.includes("login") || currentUrl.includes("authwall")) {
@@ -34,64 +35,72 @@ export async function searchLinkedIn(page, query, emit) {
 
     if (await checkCaptcha(page)) {
       emit("captcha_detected", { site: "linkedin" });
-      return jobs;
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
+        return jobs;
+      }
+      emit("progress", { message: "LinkedIn: CAPTCHA resolvido. Retomando busca..." });
     }
 
-    // Scrolla devagar para carregar resultados
-    for (let i = 0; i < 4; i++) {
-      await page.evaluate(() => window.scrollBy({ top: 400, behavior: "smooth" }));
-      await humanDelay(1000, 2000);
-    }
+    await page.waitForSelector(
+      ".jobs-search-results__list, .jobs-search-results__list-item, .job-search-card, [data-occludable-job-id]",
+      { timeout: 45000 }
+    ).catch(() => {});
 
-    const jobCards = await page.$$(
-      ".job-search-card, .jobs-search-results__list-item, [data-occludable-job-id]"
-    );
+    // Tenta extrair a lista de vagas diretamente do DOM
+    const rawJobs = await page.$$eval(
+      'li.jobs-search-results__list-item, .job-search-card, [data-occludable-job-id]',
+      (cards) => cards.slice(0, 15).map((card) => {
+        const title = (card.querySelector('.job-search-card__title, .job-card-list__title, h3')?.textContent || "").trim();
+        const company = (card.querySelector('.job-search-card__company-name, .job-card-container__company-name, .job-card__company-name')?.textContent || "").trim();
+        const location = (card.querySelector('.job-search-card__location, .job-card-container__metadata-item, .job-card-list__location')?.textContent || "").trim();
+        const linkEl = card.querySelector('a.job-search-card__title-link, a.job-card-list__title--link, a[href*="/jobs/view/"]');
+        const link = linkEl instanceof HTMLAnchorElement ? linkEl.href : "";
+        return { title, company, location, link };
+      })
+    ).catch(() => []);
 
-    emit("progress", { message: `LinkedIn: ${jobCards.length} cards encontrados` });
+    emit("progress", { message: `LinkedIn: ${rawJobs.length} cards extraídos` });
 
-    for (const card of jobCards.slice(0, 15)) {
+    for (const rawJob of rawJobs) {
+      const { title, company, location, link } = rawJob;
+      if (!title || !link) continue;
+
+      let description = "";
+      const detail = await page.context().newPage();
       try {
-        const title    = await card.$eval(
-          ".job-search-card__title, .job-card-list__title, [class*='job-card'] h3",
-          el => el.innerText.trim()
-        ).catch(() => "");
-        const company  = await card.$eval(
-          ".job-search-card__company-name, .job-card-container__company-name",
-          el => el.innerText.trim()
-        ).catch(() => "");
-        const location = await card.$eval(
-          ".job-search-card__location",
-          el => el.innerText.trim()
-        ).catch(() => "");
-        const link     = await card.$eval(
-          "a.job-search-card__title-link, a.job-card-list__title--link, a[href*='/jobs/view/']",
-          el => el.href
-        ).catch(() => "");
+        await detail.goto(link, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await humanDelay(1200, 2000);
 
-        if (!title || !link) continue;
+        if (await checkCaptcha(detail)) {
+          emit("captcha_detected", { site: "linkedin" });
+          if (!stopOnCaptcha || !await handleCaptcha(detail, stopOnCaptcha)) {
+            await detail.close();
+            continue;
+          }
+        }
 
-        // Abre a vaga para pegar descrição
-        let description = "";
-        try {
-          await card.click();
-          await humanDelay(1500, 2500);
-          description = await page.$eval(
-            ".jobs-description__content, .description__text, #job-details",
-            el => el.innerText.trim()
-          ).catch(() => "");
-        } catch {}
+        description = await detail.$eval(
+          ".jobs-description__content, .description__text, #job-details, .show-more-less-html__markup",
+          (el) => el.innerText.trim()
+        ).catch(() => "");
+      } catch {
+      } finally {
+        await detail.close();
+      }
 
-        jobs.push({
-          id: `li-${uid()}`,
-          title, company, location,
-          url: link, apply_url: link,
-          site: "linkedin",
-          description: description.slice(0, 3000),
-        });
+      jobs.push({
+        id: `li-${uid()}`,
+        title,
+        company,
+        location,
+        url: link,
+        apply_url: link,
+        site: "linkedin",
+        description: description.slice(0, 3000),
+      });
 
-        emit("job_found", { title, company, site: "linkedin", location });
-        await humanDelay(800, 1500);
-      } catch {}
+      emit("job_found", { title, company, site: "linkedin", location, id: jobs[jobs.length - 1].id, url: link, description });
+      await humanDelay(800, 1500);
     }
   } catch (err) {
     emit("progress", { message: `Erro LinkedIn: ${err.message}` });

@@ -1,9 +1,9 @@
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use serde_json::Value;
 use std::collections::HashSet;
 use uuid::Uuid;
-use crate::{NightConfig, JobListing};
+use crate::{AppState, NightConfig, JobListing};
 
 pub struct JobQueue {
     approved: HashSet<String>,
@@ -36,6 +36,7 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
     emit(&app, "night_started", serde_json::json!({"mode": config.mode}));
 
     let playwright_result = run_playwright(&app, &config, &query).await;
+    reset_running_state(&app);
 
     match playwright_result {
         Ok(summary) => {
@@ -59,6 +60,14 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
             notify(&app, "CV Agent - Erro", &friendly);
             emit(&app, "night_error", serde_json::json!({"error": friendly}));
         }
+    }
+}
+
+fn reset_running_state(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let running_lock = state.running.lock();
+    if let Ok(mut running) = running_lock {
+        *running = false;
     }
 }
 

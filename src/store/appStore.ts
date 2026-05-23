@@ -57,7 +57,7 @@ interface AppStore {
 
 const DEFAULT_CONFIG: NightConfig = {
   mode: "autonomous",
-  min_score: 72,
+  min_score: 40,
   max_per_night: 12,
   delay_minutes: 7,
   cover_letter: true,

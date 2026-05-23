@@ -35,7 +35,7 @@ const MODES = [
 export default function PageNightMode() {
   const { nightConfig, setNightConfig, running, setRunning, liveEvents, clearEvents, ollama } =
     useAppStore();
-  const [query, setQuery] = useState("desenvolvedor fullstack React");
+  const [query, setQuery] = useState("desenvolvedor");
   const [error, setError] = useState("");
   const [newCompany, setNewCompany] = useState("");
 
@@ -208,8 +208,8 @@ export default function PageNightMode() {
               onChange={(v) => set({ cover_letter: v })}
             />
             <ToggleRow
-              label="Parar em CAPTCHA"
-              sub="Se desativado, pula a vaga e continua"
+              label="Pular no CAPTCHA"
+              sub="Se ativado, pula a vaga e continua; se desativado, tenta resolver manualmente"
               value={cfg.stop_on_captcha}
               onChange={(v) => set({ stop_on_captcha: v })}
             />

@@ -1,5 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { unzipSync } from "fflate";
 import styles from "./PageResumes.module.css";
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
@@ -18,19 +19,36 @@ interface ResumePackage {
   importedAt: string;
 }
 
-// ── Extrai referências de imagem do .tex ──────────────────────────────────────
+interface SavedResumePackage {
+  name: string;
+  tex_content: string;
+  assets: { filename: string; data_url?: string; present: boolean; placeholder?: boolean }[];
+  saved_at?: string;
+}
+
+// ── Extrai referências de arquivo do .tex ──────────────────────────────────────
 
 function extractImageRefs(tex: string): string[] {
   const refs = new Set<string>();
+
+  const classPattern = /\\documentclass(?:\[[^\]]*\])?\{([^}]+)\}/g;
+  let m;
+  while ((m = classPattern.exec(tex)) !== null) {
+    const className = m[1].trim().split(",")[0];
+    if (className) {
+      refs.add(`${className}.cls`);
+    }
+  }
+
   const patterns = [
     /\\includegraphics(?:\[.*?\])?\{([^}]+)\}/g,
     /\\roundpic\{([^}]+)\}/g,
     /\}\{([^}]+\.(?:png|jpg|jpeg|pdf|eps|svg))\}/gi,
   ];
   for (const re of patterns) {
-    let m;
-    while ((m = re.exec(tex)) !== null) {
-      const f = m[1].trim();
+    let m2;
+    while ((m2 = re.exec(tex)) !== null) {
+      const f = m2[1].trim();
       if (f && !f.startsWith("\\")) refs.add(f);
     }
   }
@@ -39,67 +57,36 @@ function extractImageRefs(tex: string): string[] {
 
 // ── Leitura local de zip via DecompressionStream ───────────────────────────────
 
-async function readZipLocally(file: File): Promise<{ name: string; content: ArrayBuffer }[]> {
+async function readZipLocally(file: File): Promise<{ name: string; content: ArrayBuffer | SharedArrayBuffer }[]> {
   const buf = await file.arrayBuffer();
-  const view = new DataView(buf);
-  const results: { name: string; content: ArrayBuffer }[] = [];
-  let offset = 0;
-
-  while (offset < buf.byteLength - 4) {
-    const sig = view.getUint32(offset, true);
-    if (sig !== 0x04034b50) break;
-
-    const compression = view.getUint16(offset + 8,  true);
-    const compSize    = view.getUint32(offset + 18, true);
-    const uncompSize  = view.getUint32(offset + 22, true);
-    const nameLen     = view.getUint16(offset + 26, true);
-    const extraLen    = view.getUint16(offset + 28, true);
-    const name        = new TextDecoder().decode(new Uint8Array(buf, offset + 30, nameLen));
-    const dataOffset  = offset + 30 + nameLen + extraLen;
-
-    if (!name.endsWith("/")) {
-      const compData = new Uint8Array(buf, dataOffset, compSize);
-      let content: ArrayBuffer;
-
-      if (compression === 0) {
-        content = buf.slice(dataOffset, dataOffset + compSize);
-      } else if (compression === 8) {
-        try {
-          const ds = new (window as any).DecompressionStream("deflate-raw");
-          const writer = ds.writable.getWriter();
-          const reader = ds.readable.getReader();
-          writer.write(compData);
-          writer.close();
-          const chunks: Uint8Array[] = [];
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-          }
-          const out = new Uint8Array(uncompSize);
-          let pos = 0;
-          for (const c of chunks) { out.set(c, pos); pos += c.length; }
-          content = out.buffer;
-        } catch { content = compData.buffer; }
-      } else {
-        content = compData.buffer;
-      }
-      results.push({ name, content });
-    }
-    offset = dataOffset + compSize;
-  }
-  return results;
+  const entries = unzipSync(new Uint8Array(buf));
+  return Object.entries(entries).map(([name, data]) => {
+    const bytes = data as Uint8Array;
+    return {
+      name,
+      content: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer | SharedArrayBuffer,
+    };
+  });
 }
 
-function bufToDataUrl(buf: ArrayBuffer, filename: string): string {
+function bufToDataUrl(buf: ArrayBuffer | SharedArrayBuffer, filename: string): string {
   const ext = filename.split(".").pop()?.toLowerCase() ?? "";
   const mime: Record<string, string> = {
-    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-    gif: "image/gif", svg: "image/svg+xml",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    svg: "image/svg+xml",
+    pdf: "application/pdf",
+    eps: "application/postscript",
+    cls: "text/plain",
+    sty: "text/plain",
+    ttf: "font/ttf",
+    otf: "font/otf",
   };
   let bin = "";
   new Uint8Array(buf).forEach((b) => (bin += String.fromCharCode(b)));
-  return `data:${mime[ext] ?? "image/png"};base64,${btoa(bin)}`;
+  return `data:${mime[ext] ?? "application/octet-stream"};base64,${btoa(bin)}`;
 }
 
 // ── Componente principal ──────────────────────────────────────────────────────
@@ -111,6 +98,37 @@ export default function PageResumes() {
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    invoke<SavedResumePackage[]>("load_saved_resume_packages")
+      .then((saved) => {
+        if (!saved || saved.length === 0) return;
+        const loaded = saved.map((pkg) => {
+          const assetMap = new Map(pkg.assets.map((asset) => [asset.filename, asset.data_url ?? undefined]));
+          const placeholderMap = new Map(pkg.assets.map((asset) => [asset.filename, asset.placeholder ?? false]));
+          const refs = extractImageRefs(pkg.tex_content);
+          const assets = refs.map((filename) => {
+            const dataUrl = assetMap.get(filename) ?? undefined;
+            return {
+              filename,
+              present: !!dataUrl,
+              placeholder: placeholderMap.get(filename) ?? !dataUrl,
+              dataUrl,
+            };
+          });
+
+          return {
+            name: pkg.name,
+            texContent: pkg.tex_content,
+            assets,
+            importedAt: pkg.saved_at || "salvo",
+          };
+        });
+        setPackages(loaded);
+        setSelected(0);
+      })
+      .catch(() => undefined);
+  }, []);
 
   const pkg = selected !== null ? packages[selected] : null;
 
@@ -134,7 +152,7 @@ export default function PageResumes() {
           const shortName = entry.name.split("/").pop()!;
           if (shortName.endsWith(".tex") && !texContent) {
             texContent = new TextDecoder().decode(entry.content);
-          } else if (/\.(png|jpg|jpeg|gif|svg)$/i.test(shortName)) {
+          } else if (/\.(png|jpg|jpeg|gif|svg|cls|sty|pdf|eps|ttf|otf)$/i.test(shortName)) {
             assetMap.set(shortName, bufToDataUrl(entry.content, shortName));
           }
         }
@@ -143,12 +161,15 @@ export default function PageResumes() {
       if (!texContent) { setError("Nenhum arquivo .tex encontrado no zip"); return; }
 
       const refs = extractImageRefs(texContent);
-      const assets: TexAsset[] = refs.map((filename) => ({
-        filename,
-        present: assetMap.has(filename),
-        placeholder: false,
-        dataUrl: assetMap.get(filename),
-      }));
+      const assets: TexAsset[] = refs.map((filename) => {
+        const dataUrl = assetMap.get(filename);
+        return {
+          filename,
+          present: !!dataUrl,
+          placeholder: !dataUrl,
+          dataUrl,
+        };
+      });
 
       const newPkg: ResumePackage = {
         name: file.name.replace(/\.(zip|tex)$/, ""),
@@ -168,6 +189,7 @@ export default function PageResumes() {
         name: newPkg.name,
         texContent,
         assets: Object.fromEntries(assetMap),
+        placeholderAssets: newPkg.assets.filter(a => a.placeholder).map(a => a.filename),
       }).catch(() => {});
     } catch (e: any) {
       setError(`Erro ao importar: ${e.message ?? e}`);
@@ -203,6 +225,25 @@ export default function PageResumes() {
       const p = { ...next[selected], assets: [...next[selected].assets] };
       p.assets[assetIdx] = { ...p.assets[assetIdx], placeholder: !p.assets[assetIdx].placeholder };
       next[selected] = p;
+      
+      // Persist to backend with placeholder metadata
+      const assetMap = new Map<string, string>();
+      const placeholderAssets: string[] = [];
+      for (const asset of p.assets) {
+        if (asset.dataUrl) {
+          assetMap.set(asset.filename, asset.dataUrl);
+        }
+        if (asset.placeholder) {
+          placeholderAssets.push(asset.filename);
+        }
+      }
+      invoke("save_resume_package", {
+        name: p.name,
+        texContent: p.texContent,
+        assets: Object.fromEntries(assetMap),
+        placeholderAssets,
+      }).catch(() => {});
+      
       return next;
     });
   }
@@ -214,6 +255,26 @@ export default function PageResumes() {
       next[selected] = { ...next[selected], texContent: val };
       return next;
     });
+  }
+
+  function handleDelete() {
+    if (selected === null) return;
+    const pkgName = packages[selected].name;
+    if (!confirm(`Tem certeza que deseja excluir "${pkgName}"? Esta ação não pode ser desfeita.`)) {
+      return;
+    }
+    invoke("delete_resume_package", { name: pkgName })
+      .then(() => {
+        setPackages((prev) => {
+          const next = prev.filter((_, i) => i !== selected);
+          setSelected(next.length > 0 ? 0 : null);
+          return next;
+        });
+        setError("");
+      })
+      .catch((e: any) => {
+        setError(`Erro ao excluir: ${e.message ?? e}`);
+      });
   }
 
   const missingCount     = pkg?.assets.filter((a) => !a.present && !a.placeholder).length ?? 0;
@@ -287,10 +348,28 @@ export default function PageResumes() {
                   <div className={styles.detailName}>{pkg.name}</div>
                   <div className={styles.detailMeta}>Importado em {pkg.importedAt}</div>
                 </div>
-                <div className={styles.statRow}>
-                  {presentCount > 0     && <StatPill color="green"  label="presentes"   value={presentCount} />}
-                  {placeholderCount > 0 && <StatPill color="amber"  label="placeholder" value={placeholderCount} />}
-                  {missingCount > 0     && <StatPill color="red"    label="faltando"    value={missingCount} />}
+                <div style={{ display: "flex", gap: "1rem", alignItems: "center" }}>
+                  <div className={styles.statRow}>
+                    {presentCount > 0     && <StatPill color="green"  label="presentes"   value={presentCount} />}
+                    {placeholderCount > 0 && <StatPill color="amber"  label="placeholder" value={placeholderCount} />}
+                    {missingCount > 0     && <StatPill color="red"    label="faltando"    value={missingCount} />}
+                  </div>
+                  <button
+                    onClick={handleDelete}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      backgroundColor: "#dc2626",
+                      color: "white",
+                      border: "none",
+                      borderRadius: "4px",
+                      cursor: "pointer",
+                      fontSize: "0.9rem",
+                      fontWeight: "500",
+                    }}
+                    title="Excluir este currículo"
+                  >
+                    🗑 Excluir
+                  </button>
                 </div>
               </div>
 

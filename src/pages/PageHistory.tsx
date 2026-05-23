@@ -20,18 +20,38 @@ const STATUS_LABEL: Record<string, string> = {
   error:    "Erro",
 };
 
+const STATUS_FILTERS = [
+  { id: "applied",  label: "Enviado" },
+  { id: "skipped",  label: "Pulado" },
+  { id: "captcha",  label: "CAPTCHA" },
+  { id: "error",    label: "Erro" },
+];
+
 export default function PageHistory() {
   const [jobs, setJobs] = useState<any[]>([]);
-  const [filter, setFilter] = useState("all");
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>([
+    "applied",
+    "skipped",
+    "captcha",
+    "error",
+  ]);
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const loadJobs = async () => {
+    setLoading(true);
+    const status = selectedStatuses.length === 0 ? null : selectedStatuses;
     invoke<any[]>("get_jobs", {
       limit: 100,
-      status: filter === "all" ? null : filter,
-    }).then(setJobs).catch(console.error);
-  }, [filter]);
+      status,
+    })
+      .then(setJobs)
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  };
 
-  const filters = ["all", "applied", "skipped", "captcha", "error"];
+  useEffect(() => {
+    loadJobs();
+  }, [selectedStatuses]);
 
   return (
     <div style={{ padding: "28px 32px" }}>
@@ -40,26 +60,67 @@ export default function PageHistory() {
         Todas as vagas encontradas e candidaturas enviadas
       </p>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
-        {filters.map((f) => (
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {STATUS_FILTERS.map((filter) => (
+            <label key={filter.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text2)" }}>
+              <input
+                type="checkbox"
+                checked={selectedStatuses.includes(filter.id)}
+                onChange={() => {
+                  setSelectedStatuses((prev) =>
+                    prev.includes(filter.id)
+                      ? prev.filter((status) => status !== filter.id)
+                      : [...prev, filter.id]
+                  );
+                }}
+              />
+              {filter.label}
+            </label>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button
-            key={f}
-            onClick={() => setFilter(f)}
+            onClick={() => setSelectedStatuses(STATUS_FILTERS.map((f) => f.id))}
             style={{
-              background: filter === f ? "var(--accent)" : "var(--bg2)",
-              color: filter === f ? "#fff" : "var(--text2)",
-              border: `1px solid ${filter === f ? "var(--accent)" : "var(--border)"}`,
+              background: "var(--bg2)",
+              color: "var(--text2)",
+              border: "1px solid var(--border)",
               borderRadius: 6,
               padding: "5px 12px",
               fontSize: 12,
             }}
           >
-            {f === "all" ? "Todos" : STATUS_LABEL[f] ?? f}
+            Selecionar todos
           </button>
-        ))}
+          <button
+            onClick={async () => {
+              if (!window.confirm("Tem certeza que deseja limpar todo o histórico de vagas?")) return;
+              try {
+                await invoke("clear_history");
+                loadJobs();
+              } catch (err) {
+                console.error(err);
+              }
+            }}
+            style={{
+              background: "var(--red)",
+              color: "#fff",
+              border: "1px solid transparent",
+              borderRadius: 6,
+              padding: "5px 12px",
+              fontSize: 12,
+            }}
+          >
+            Limpar histórico
+          </button>
+        </div>
       </div>
 
-      {jobs.length === 0 ? (
+      {loading ? (
+        <div style={{ color: "var(--text2)", fontSize: 13 }}>Carregando histórico...</div>
+      ) : jobs.length === 0 ? (
         <div style={{ color: "var(--text3)", fontSize: 13 }}>
           Nenhuma vaga registrada ainda. Inicie o modo noturno para começar.
         </div>

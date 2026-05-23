@@ -1,8 +1,8 @@
 // playwright/src/sites/indeed.js
 import { humanDelay, waitForVisible, uploadFile } from "../utils.js";
-import { checkCaptcha } from "../captcha.js";
+import { checkCaptcha, handleCaptcha } from "../captcha.js";
 
-export async function searchIndeed(page, query, emit) {
+export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
   const encoded = encodeURIComponent(query);
   try {
@@ -10,10 +10,13 @@ export async function searchIndeed(page, query, emit) {
       waitUntil: "domcontentloaded", timeout: 30000
     });
     await humanDelay(1500, 2500);
+    await page.waitForSelector('.job_seen_beacon, .resultContent, .slider_container', { timeout: 30000 }).catch(() => {});
 
     if (await checkCaptcha(page)) {
       emit("captcha_detected", { site: "indeed" });
-      return jobs;
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
+        return jobs;
+      }
     }
 
     const cards = await page.$$('.job_seen_beacon, .resultContent');
@@ -33,13 +36,22 @@ export async function searchIndeed(page, query, emit) {
           description = await det.$eval('#jobDescriptionText', el => el.innerText.trim()).catch(() => "");
         } finally { await det.close(); }
 
+        const jobId = `in-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
         jobs.push({
-          id: `in-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          id: jobId,
           title, company, location, url: link, apply_url: link,
           site: "indeed",
           description: description.slice(0, 3000)
         });
-        emit("job_found", { title, company, site: "indeed", location });
+        emit("job_found", {
+          id: jobId,
+          title,
+          company,
+          site: "indeed",
+          location,
+          url: link,
+          description: description.slice(0, 3000),
+        });
       } catch {}
       await humanDelay(300, 700);
     }

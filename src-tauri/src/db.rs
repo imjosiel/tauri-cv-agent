@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result, ToSql, params};
 use crate::{JobListing, NightReport};
 use chrono::Local;
 
@@ -92,27 +92,47 @@ impl Database {
     pub fn get_jobs(
         &self,
         limit: Option<i64>,
-        status: Option<String>,
+        status: Option<Vec<String>>,
     ) -> Result<Vec<JobListing>> {
         let lim = limit.unwrap_or(100);
-        let mut stmt = match &status {
-            Some(s) => {
-                let mut st = self.conn.prepare(
+        if let Some(status_list) = status {
+            if status_list.is_empty() {
+                let mut stmt = self.conn.prepare(
                     "SELECT id,title,company,url,site,description,score,status,
                             applied_at,resume_path,skip_reason,screenshot_path
-                     FROM jobs WHERE status=?1 ORDER BY created_at DESC LIMIT ?2"
+                     FROM jobs ORDER BY created_at DESC LIMIT ?1"
                 )?;
-                let rows = st.query_map(params![s, lim], map_row)?;
+                let rows = stmt.query_map(params![lim], map_row)?;
                 return rows.collect();
             }
-            None => self.conn.prepare(
-                "SELECT id,title,company,url,site,description,score,status,
-                        applied_at,resume_path,skip_reason,screenshot_path
-                 FROM jobs ORDER BY created_at DESC LIMIT ?1"
-            )?,
-        };
+
+            let placeholders = status_list.iter().map(|_| "?".to_string()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id,title,company,url,site,description,score,status,\n                        applied_at,resume_path,skip_reason,screenshot_path\n                 FROM jobs WHERE status IN ({}) ORDER BY created_at DESC LIMIT ?{}",
+                placeholders,
+                status_list.len() + 1
+            );
+
+            let mut params: Vec<&dyn ToSql> = status_list.iter().map(|s| s as &dyn ToSql).collect();
+            params.push(&lim);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), map_row)?;
+            return rows.collect();
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id,title,company,url,site,description,score,status,
+                    applied_at,resume_path,skip_reason,screenshot_path
+             FROM jobs ORDER BY created_at DESC LIMIT ?1"
+        )?;
         let rows = stmt.query_map(params![lim], map_row)?;
         rows.collect()
+    }
+
+    pub fn clear_history(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM jobs", params![])?;
+        self.conn.execute("DELETE FROM night_sessions", params![])?;
+        Ok(())
     }
 
     pub fn get_report(&self, date: Option<String>) -> Result<NightReport> {

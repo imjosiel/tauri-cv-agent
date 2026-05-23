@@ -85,6 +85,8 @@ REGRAS:
 - NÃO invente experiências ou habilidades que não existem
 - NÃO altere datas, empresas, cargos ou conquistas
 - Responda APENAS com JSON válido, sem markdown
+- Use \\n para quebras de linha dentro do LaTeX; não use quebras literais
+- Escape corretamente todas as aspas e barras invertidas; cada barra invertida LaTeX deve aparecer como \\\\ no JSON
 
 CURRÍCULO ORIGINAL (LaTeX):
 {}

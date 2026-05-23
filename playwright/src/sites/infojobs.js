@@ -1,8 +1,8 @@
 // playwright/src/sites/infojobs.js
 import { humanDelay, waitForVisible } from "../utils.js";
-import { checkCaptcha } from "../captcha.js";
+import { checkCaptcha, handleCaptcha } from "../captcha.js";
 
-export async function searchInfoJobs(page, query, emit) {
+export async function searchInfoJobs(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
   const encoded = encodeURIComponent(query);
   try {
@@ -13,7 +13,9 @@ export async function searchInfoJobs(page, query, emit) {
 
     if (await checkCaptcha(page)) {
       emit("captcha_detected", { site: "infojobs" });
-      return jobs;
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
+        return jobs;
+      }
     }
 
     const cards = await page.$$('.ij-OfferList-item, .offer-list-item, [class*="OfferCard"]');

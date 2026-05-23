@@ -7,6 +7,7 @@ mod ollama;
 mod latex;
 mod queue;
 mod resume;
+mod texlive;
 
 pub use db::Database;
 pub use queue::JobQueue;
@@ -137,11 +138,17 @@ async fn stop_night_mode(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn get_jobs(
     limit: Option<i64>,
-    status: Option<String>,
+    status: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<Vec<JobListing>, String> {
     let db = state.db.lock().unwrap();
     db.get_jobs(limit, status).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.clear_history().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -154,6 +161,12 @@ async fn get_night_report(
 }
 
 #[tauri::command]
+async fn save_job(job: JobListing, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.upsert_job(&job).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_resume_templates() -> Result<Vec<String>, String> {
     latex::list_templates().map_err(|e| e.to_string())
 }
@@ -161,6 +174,11 @@ async fn get_resume_templates() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn read_resume_template(name: String) -> Result<String, String> {
     latex::read_template(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn load_saved_resume_packages() -> Result<Vec<resume::SavedResumePackage>, String> {
+    resume::load_saved_packages().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -177,7 +195,7 @@ async fn search_jobs(
         max_per_night: 30,
         delay_minutes: 1,
         cover_letter: false,
-        stop_on_captcha: false,
+        stop_on_captcha: true,
         blacklist: vec![],
         sites,
         modality,
@@ -241,9 +259,13 @@ pub fn run() {
             get_night_report,
             get_resume_templates,
             read_resume_template,
+            load_saved_resume_packages,
             approve_job,
             skip_job,
+            save_job,
+            clear_history,
             resume::save_resume_package,
+            resume::delete_resume_package,
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao iniciar aplicação");

@@ -65,15 +65,15 @@ export async function checkCaptcha(page) {
 }
 
 /**
- * Tenta esperar resolução manual do CAPTCHA por até 3 minutos.
+ * Tenta esperar resolução manual do CAPTCHA por até 5 minutos.
  * Se stop_on_captcha=false, apenas registra e pula.
  */
 export async function handleCaptcha(page, stopOnCaptcha) {
   if (stopOnCaptcha) {
     // Para tudo e aguarda resolução manual
     let resolved = false;
-    for (let i = 0; i < 36; i++) {
-      // 36 × 5s = 3 min
+    for (let i = 0; i < 60; i++) {
+      // 60 × 5s = 5 min
       await new Promise((r) => setTimeout(r, 5000));
       const stillHasCaptcha = await checkCaptcha(page);
       if (!stillHasCaptcha) {

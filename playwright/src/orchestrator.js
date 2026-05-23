@@ -34,7 +34,7 @@ export async function runSearch({ context, query, config, emit, log }) {
 
     try {
       const page = await context.newPage();
-      const jobs = await searcher(page, query + locationSuffix, emit);
+      const jobs = await searcher(page, query + locationSuffix, emit, config.stop_on_captcha);
       await page.close();
 
       const filtered = modality === "any"
@@ -136,6 +136,7 @@ export async function runSearch({ context, query, config, emit, log }) {
       const result = await submitApplication({
         page, job, pdfPath,
         coverLetter: config.cover_letter ? resumeResult.cover_letter : null,
+        stopOnCaptcha: config.stop_on_captcha,
         emit,
       });
 
@@ -195,38 +196,79 @@ function matchesModality(job, modality) {
   return true;
 }
 
-async function submitApplication({ page, job, pdfPath, coverLetter, emit }) {
+async function submitApplication({ page, job, pdfPath, coverLetter, stopOnCaptcha, emit }) {
   emit("progress", { message: `Abrindo candidatura: ${job.title} @ ${job.company}` });
 
   await page.goto(job.apply_url ?? job.url, { waitUntil: "networkidle", timeout: 30000 });
   await humanDelay(1500, 2500);
 
   // Verifica CAPTCHA antes de qualquer ação
-  const hasCaptcha = await checkCaptcha(page);
-  if (hasCaptcha) {
+  if (await checkCaptcha(page)) {
     const screenshotPath = await takeScreenshot(page, job.id);
-    return { success: false, captcha: true, screenshot: screenshotPath };
+    if (stopOnCaptcha) {
+      emit("progress", { message: "CAPTCHA detectado. Aguardando resolução manual..." });
+      const resolved = await handleCaptcha(page, true);
+      if (!resolved) {
+        return { success: false, captcha: true, screenshot: screenshotPath };
+      }
+      emit("progress", { message: "CAPTCHA resolvido. Retomando envio..." });
+    } else {
+      return { success: false, captcha: true, screenshot: screenshotPath };
+    }
   }
 
-  // Cada site tem seu próprio handler de submissão
-  // O site já está na URL, então detectamos pelo domínio
-  const url = page.url();
-  try {
-    if (url.includes("linkedin.com")) {
-      return await submitLinkedIn(page, pdfPath, coverLetter);
-    } else if (url.includes("indeed.com")) {
-      return await submitIndeed(page, pdfPath, coverLetter);
-    } else if (url.includes("catho.com")) {
-      return await submitCatho(page, pdfPath, coverLetter);
-    } else if (url.includes("infojobs.com")) {
-      return await submitInfoJobs(page, pdfPath, coverLetter);
-    } else {
-      return { success: false, reason: `Site não suportado: ${url}` };
+  let attempts = 0;
+  while (true) {
+    const url = page.url();
+    try {
+        const siteResult = url.includes("linkedin.com")
+        ? await submitLinkedIn(page, pdfPath, coverLetter)
+        : url.includes("indeed.com")
+          ? await submitIndeed(page, pdfPath, coverLetter)
+          : url.includes("catho.com")
+            ? await submitCatho(page, pdfPath, coverLetter)
+            : url.includes("infojobs.com")
+              ? await submitInfoJobs(page, pdfPath, coverLetter)
+              : { success: false, reason: `Site não suportado: ${url}` };
+
+      let result = siteResult;
+      if (!result.success && !result.captcha) {
+        try {
+          const { applyGeneric } = await import("./sites/generic.js");
+          const contact = resumeResult?.contact ?? null;
+          const generic = await applyGeneric(page, pdfPath, resumeResult?.cover_letter ?? coverLetter, contact, emit, log);
+          if (generic.success) {
+            result = generic;
+          } else {
+            result.reason = result.reason
+              ? `${result.reason} | fallback: ${generic.reason}`
+              : `fallback: ${generic.reason}`;
+          }
+        } catch (e) {
+          result.reason = result.reason
+            ? `${result.reason} | fallback error: ${e.message}`
+            : `fallback error: ${e.message}`;
+        }
+      }
+
+      if (result.captcha && stopOnCaptcha && attempts < 1) {
+        attempts++;
+        emit("progress", { message: "CAPTCHA detectado durante envio. Aguardando resolução manual..." });
+        const solved = await handleCaptcha(page, true);
+        if (!solved) {
+          const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
+          return { success: false, captcha: true, screenshot: screenshotPath };
+        }
+        emit("progress", { message: "CAPTCHA resolvido. Retentando envio..." });
+        continue;
+      }
+
+      return result;
+    } catch (err) {
+      // Tenta screenshot para debug
+      const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
+      return { success: false, reason: err.message, screenshot: screenshotPath };
     }
-  } catch (err) {
-    // Tenta screenshot para debug
-    const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
-    return { success: false, reason: err.message, screenshot: screenshotPath };
   }
 }
 
