@@ -17,7 +17,7 @@ const SITE_SEARCHERS = {
 
 export async function runSearch({ context, query, config, emit, log }) {
   const { mode, min_score, max_per_night, delay_minutes, sites, blacklist,
-          modality = "any", locations = [] } = config;
+          stop_on_captcha = false, modality = "any", locations = [] } = config;
 
   let applied = 0;
   const allJobs = [];
@@ -34,7 +34,7 @@ export async function runSearch({ context, query, config, emit, log }) {
 
     try {
       const page = await context.newPage();
-      const jobs = await searcher(page, query + locationSuffix, emit, config.stop_on_captcha);
+      const jobs = await searcher(page, query + locationSuffix, emit);
       await page.close();
 
       const filtered = modality === "any"
@@ -50,10 +50,8 @@ export async function runSearch({ context, query, config, emit, log }) {
     }
   }
 
-  emit("progress", { message: `Total: ${allJobs.length} vagas. Analisando...` });
-  log(`Total: ${allJobs.length} vagas`);
-
   emit("progress", { message: `Total: ${allJobs.length} vagas. Iniciando análise...` });
+  log(`Total: ${allJobs.length} vagas`);
 
   // 2. Processa cada vaga
   for (const job of allJobs) {
@@ -99,10 +97,10 @@ export async function runSearch({ context, query, config, emit, log }) {
       continue;
     }
 
-    // Modo manual: aguarda aprovação (timeout de 5 min)
+    // Modo manual: aguarda aprovação via IPC Tauri (evento bidirecional)
     if (mode === "manual") {
       emit("job_awaiting_approval", job);
-      const approved = await waitForApproval(job.id, 5 * 60 * 1000);
+      const approved = await waitForApproval(job.id, 5 * 60 * 1000, emit);
       if (!approved) {
         emit("job_skipped", { ...job, skip_reason: "Aprovação manual não recebida" });
         continue;
@@ -136,8 +134,9 @@ export async function runSearch({ context, query, config, emit, log }) {
       const result = await submitApplication({
         page, job, pdfPath,
         coverLetter: config.cover_letter ? resumeResult.cover_letter : null,
-        stopOnCaptcha: config.stop_on_captcha,
+        stopOnCaptcha: stop_on_captcha, // FIX: agora passado corretamente
         emit,
+        log,
       });
 
       if (result.success) {
@@ -147,7 +146,7 @@ export async function runSearch({ context, query, config, emit, log }) {
         emit("captcha_detected", {
           ...job,
           screenshot_path: result.screenshot,
-          skip_reason: "CAPTCHA detectado",
+          skip_reason: "CAPTCHA detectado — não resolvido dentro do tempo limite",
         });
       } else {
         emit("job_skipped", { ...job, skip_reason: result.reason ?? "Erro desconhecido no envio" });
@@ -170,7 +169,6 @@ export async function runSearch({ context, query, config, emit, log }) {
   emit("progress", { message: `Concluído: ${applied} candidatura(s) enviada(s)` });
   log(`Concluído: ${applied} enviadas`);
 
-  // Emite night_finished para o frontend saber que terminou
   process.stdout.write(JSON.stringify({
     event: "night_finished",
     applied,
@@ -196,79 +194,48 @@ function matchesModality(job, modality) {
   return true;
 }
 
-async function submitApplication({ page, job, pdfPath, coverLetter, stopOnCaptcha, emit }) {
+async function submitApplication({ page, job, pdfPath, coverLetter, stopOnCaptcha, emit, log }) {
   emit("progress", { message: `Abrindo candidatura: ${job.title} @ ${job.company}` });
 
   await page.goto(job.apply_url ?? job.url, { waitUntil: "networkidle", timeout: 30000 });
   await humanDelay(1500, 2500);
 
-  // Verifica CAPTCHA antes de qualquer ação
-  if (await checkCaptcha(page)) {
-    const screenshotPath = await takeScreenshot(page, job.id);
+  // FIX: verifica CAPTCHA e aguarda resolução se stop_on_captcha=true
+  const hasCaptcha = await checkCaptcha(page);
+  if (hasCaptcha) {
+    emit("progress", { message: `CAPTCHA detectado em ${job.company}. ${stopOnCaptcha ? "Aguardando resolução manual (3 min)..." : "Pulando vaga."}` });
+
     if (stopOnCaptcha) {
-      emit("progress", { message: "CAPTCHA detectado. Aguardando resolução manual..." });
       const resolved = await handleCaptcha(page, true);
       if (!resolved) {
+        const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
         return { success: false, captcha: true, screenshot: screenshotPath };
       }
-      emit("progress", { message: "CAPTCHA resolvido. Retomando envio..." });
+      // CAPTCHA resolvido pelo usuário — continua
+      emit("progress", { message: `CAPTCHA resolvido! Continuando candidatura em ${job.company}...` });
     } else {
+      const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
       return { success: false, captcha: true, screenshot: screenshotPath };
     }
   }
 
-  let attempts = 0;
-  while (true) {
-    const url = page.url();
-    try {
-        const siteResult = url.includes("linkedin.com")
-        ? await submitLinkedIn(page, pdfPath, coverLetter)
-        : url.includes("indeed.com")
-          ? await submitIndeed(page, pdfPath, coverLetter)
-          : url.includes("catho.com")
-            ? await submitCatho(page, pdfPath, coverLetter)
-            : url.includes("infojobs.com")
-              ? await submitInfoJobs(page, pdfPath, coverLetter)
-              : { success: false, reason: `Site não suportado: ${url}` };
-
-      let result = siteResult;
-      if (!result.success && !result.captcha) {
-        try {
-          const { applyGeneric } = await import("./sites/generic.js");
-          const contact = resumeResult?.contact ?? null;
-          const generic = await applyGeneric(page, pdfPath, resumeResult?.cover_letter ?? coverLetter, contact, emit, log);
-          if (generic.success) {
-            result = generic;
-          } else {
-            result.reason = result.reason
-              ? `${result.reason} | fallback: ${generic.reason}`
-              : `fallback: ${generic.reason}`;
-          }
-        } catch (e) {
-          result.reason = result.reason
-            ? `${result.reason} | fallback error: ${e.message}`
-            : `fallback error: ${e.message}`;
-        }
-      }
-
-      if (result.captcha && stopOnCaptcha && attempts < 1) {
-        attempts++;
-        emit("progress", { message: "CAPTCHA detectado durante envio. Aguardando resolução manual..." });
-        const solved = await handleCaptcha(page, true);
-        if (!solved) {
-          const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
-          return { success: false, captcha: true, screenshot: screenshotPath };
-        }
-        emit("progress", { message: "CAPTCHA resolvido. Retentando envio..." });
-        continue;
-      }
-
-      return result;
-    } catch (err) {
-      // Tenta screenshot para debug
-      const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
-      return { success: false, reason: err.message, screenshot: screenshotPath };
+  // Cada site tem seu próprio handler de submissão
+  const url = page.url();
+  try {
+    if (url.includes("linkedin.com")) {
+      return await submitLinkedIn(page, pdfPath, coverLetter);
+    } else if (url.includes("indeed.com")) {
+      return await submitIndeed(page, pdfPath, coverLetter);
+    } else if (url.includes("catho.com")) {
+      return await submitCatho(page, pdfPath, coverLetter);
+    } else if (url.includes("infojobs.com")) {
+      return await submitInfoJobs(page, pdfPath, coverLetter);
+    } else {
+      return { success: false, reason: `Site não suportado: ${url}` };
     }
+  } catch (err) {
+    const screenshotPath = await takeScreenshot(page, job.id).catch(() => null);
+    return { success: false, reason: err.message, screenshot: screenshotPath };
   }
 }
 
@@ -281,22 +248,53 @@ async function takeScreenshot(page, jobId) {
   return path;
 }
 
-// Aguarda sinal de aprovação via arquivo de controle (IPC simples)
-async function waitForApproval(jobId, timeoutMs) {
-  const { existsSync, unlinkSync } = await import("fs");
-  const flagFile = `${process.env.APPDATA ?? "."}/cv-agent/approvals/${jobId}.approve`;
-  const skipFile = `${process.env.APPDATA ?? "."}/cv-agent/approvals/${jobId}.skip`;
+// FIX: IPC via stdin em vez de polling de arquivo
+// O Rust envia linhas JSON no stdin do processo Node quando o usuário aprova/pula
+async function waitForApproval(jobId, timeoutMs, emit) {
+  emit("progress", { message: `Aguardando aprovação manual para job ${jobId}...` });
 
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (existsSync(flagFile)) { unlinkSync(flagFile); return true; }
-    if (existsSync(skipFile)) { unlinkSync(skipFile); return false; }
-    await humanDelay(2000, 2000);
-  }
-  return false;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, timeoutMs);
+
+    let buffer = "";
+
+    function onData(chunk) {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // mantém linha incompleta
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const msg = JSON.parse(trimmed);
+          if (msg.job_id !== jobId) continue;
+          if (msg.action === "approve") {
+            cleanup();
+            resolve(true);
+          } else if (msg.action === "skip") {
+            cleanup();
+            resolve(false);
+          }
+        } catch {}
+      }
+    }
+
+    function cleanup() {
+      clearTimeout(timer);
+      process.stdin.off("data", onData);
+    }
+
+    process.stdin.setEncoding("utf8");
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
 }
 
-// Stubs de submissão por site (implementados em arquivos separados)
+// Stubs de submissão por site
 async function submitLinkedIn(page, pdfPath, coverLetter) {
   const { applyLinkedIn } = await import("./sites/linkedin.js");
   return applyLinkedIn(page, pdfPath, coverLetter);
