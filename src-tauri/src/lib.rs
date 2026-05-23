@@ -257,6 +257,8 @@ pub fn run() {
             approve_job,
             skip_job,
             resume::save_resume_package,
+            resume::load_saved_resume_packages,
+            resume::delete_resume_package,
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao iniciar aplicação");
