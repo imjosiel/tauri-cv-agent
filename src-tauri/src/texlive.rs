@@ -1,9 +1,46 @@
-use anyhow::{Result, anyhow};
+// src-tauri/src/texlive.rs
+//
+// Responsável por garantir que pdflatex esteja disponível.
+//
+// Estratégia:
+//   1. Verifica se já temos TinyTeX instalado em %APPDATA%/cv-agent/tinytex
+//   2. Verifica se há TeX Live instalado no sistema (C:\texlive\*, /usr/...)
+//   3. Baixa e instala TinyTeX automaticamente, emitindo eventos de progresso
+//      para o frontend mostrar uma barra de progresso
+//
+// Após instalar, garante que os pacotes necessários para o simplehipstercv
+// estão instalados via tlmgr.
+
+use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tauri::{AppHandle, Emitter};
 
-const TINYTEX_VERSION: &str = "2026-01-15";
-const TINYTEX_URL: &str = "https://github.com/yihui/tinytex-releases/releases/download/v2026.01/TinyTeX-1.zip";
+// Pacotes necessários para o simplehipstercv e templates comuns de CV
+const REQUIRED_PACKAGES: &[&str] = &[
+    "fontawesome",
+    "paracol",
+    "smartdiagram",
+    "tikz-3dplot",
+    "raleway",
+    "hyperref",
+    "geometry",
+    "titlesec",
+    "xcolor",
+    "float",
+    "inputenc",
+    "fontenc",
+];
+
+// URL da release "latest" do TinyTeX — redireciona sempre para a versão atual
+// sem precisar hardcodar uma data ou tag específica.
+#[cfg(target_os = "windows")]
+const TINYTEX_URL: &str =
+    "https://github.com/rstudio/tinytex-releases/releases/latest/download/TinyTeX-1.zip";
+
+#[cfg(not(target_os = "windows"))]
+const TINYTEX_URL: &str =
+    "https://github.com/rstudio/tinytex-releases/releases/latest/download/TinyTeX-1.tar.gz";
 
 fn data_dir() -> PathBuf {
     dirs_next::data_dir()
@@ -11,152 +48,321 @@ fn data_dir() -> PathBuf {
         .join("cv-agent")
 }
 
-fn texlive_dir() -> PathBuf {
-    data_dir().join("texlive")
+fn tinytex_dir() -> PathBuf {
+    data_dir().join("tinytex")
 }
 
-fn texlive_bin_path() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        texlive_dir().join("bin").join("win32")
-    } else {
-        texlive_dir().join("bin").join("x86_64-linux")
-    }
-}
+/// Retorna o diretório de binários do TinyTeX instalado localmente.
+/// O layout interno do TinyTeX muda entre versões; testamos os caminhos
+/// conhecidos em ordem e retornamos o primeiro que existir.
+fn tinytex_bin_dir() -> Option<PathBuf> {
+    let root = tinytex_dir();
 
-pub fn tex_command(cmd: &str) -> PathBuf {
-    let bin_dir = texlive_bin_path();
-    if bin_dir.exists() {
-        let exe_name = if cfg!(target_os = "windows") {
-            format!("{}.exe", cmd)
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        root.join("bin").join("windows"),
+        root.join("bin").join("win32"),
+        // TinyTeX extrai com uma subpasta extra às vezes
+        root.join("TinyTeX").join("bin").join("windows"),
+        root.join("TinyTeX").join("bin").join("win32"),
+    ];
+
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        root.join("bin").join("universal-darwin"),
+        root.join("bin").join("x86_64-darwin"),
+        root.join("TinyTeX").join("bin").join("universal-darwin"),
+        root.join("TinyTeX").join("bin").join("x86_64-darwin"),
+    ];
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let candidates = [
+        root.join("bin").join("x86_64-linux"),
+        root.join("bin").join("aarch64-linux"),
+        root.join("TinyTeX").join("bin").join("x86_64-linux"),
+        root.join("TinyTeX").join("bin").join("aarch64-linux"),
+    ];
+
+    candidates.into_iter().find(|p| {
+        let exe = if cfg!(target_os = "windows") {
+            p.join("pdflatex.exe")
         } else {
-            cmd.to_string()
+            p.join("pdflatex")
         };
-        let path = bin_dir.join(exe_name);
-        if path.exists() {
-            return path;
+        exe.exists()
+    })
+}
+
+/// Procura TeX Live instalado no sistema (não pelo cv-agent).
+fn system_texlive_bin() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let roots: Vec<PathBuf> = (2020u32..=2030)
+        .flat_map(|year| {
+            vec![
+                PathBuf::from(format!("C:\\texlive\\{}\\bin\\windows", year)),
+                PathBuf::from(format!("C:\\texlive\\{}\\bin\\win32", year)),
+            ]
+        })
+        .collect();
+
+    #[cfg(not(target_os = "windows"))]
+    let roots: Vec<PathBuf> = (2020u32..=2030)
+        .flat_map(|year| {
+            vec![
+                PathBuf::from(format!("/usr/local/texlive/{}/bin/x86_64-linux", year)),
+                PathBuf::from(format!("/usr/local/texlive/{}/bin/aarch64-linux", year)),
+                PathBuf::from(format!(
+                    "/usr/local/texlive/{}/bin/universal-darwin",
+                    year
+                )),
+            ]
+        })
+        .chain([PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin")])
+        .collect();
+
+    roots.into_iter().find(|p| {
+        let exe = if cfg!(target_os = "windows") {
+            p.join("pdflatex.exe")
+        } else {
+            p.join("pdflatex")
+        };
+        exe.exists()
+    })
+}
+
+/// Retorna o caminho completo para um comando TeX (pdflatex, tlmgr, latexmk…).
+/// Prioridade: TinyTeX local > TeX Live do sistema > PATH.
+pub fn tex_command(cmd: &str) -> PathBuf {
+    let exe_name = if cfg!(target_os = "windows") {
+        format!("{}.exe", cmd)
+    } else {
+        cmd.to_string()
+    };
+
+    if let Some(bin) = tinytex_bin_dir() {
+        let p = bin.join(&exe_name);
+        if p.exists() {
+            return p;
         }
     }
+
+    if let Some(bin) = system_texlive_bin() {
+        let p = bin.join(&exe_name);
+        if p.exists() {
+            return p;
+        }
+    }
+
     PathBuf::from(cmd)
 }
 
-pub async fn ensure_texlive() -> Result<()> {
-    let bin_path = texlive_bin_path();
-    
-    // Verifica se já tem TinyTeX instalado localmente
-    if bin_path.join("pdflatex").exists() || bin_path.join("pdflatex.exe").exists() {
-        log::info!("TinyTeX já instalado em {:?}", bin_path);
+/// Ponto de entrada: garante que pdflatex está disponível.
+/// Se não estiver, baixa e instala o TinyTeX emitindo eventos de progresso.
+pub async fn ensure_texlive(app: Option<&AppHandle>) -> Result<()> {
+    // 1. TinyTeX local já instalado?
+    if tinytex_bin_dir().is_some() {
+        log::info!("TinyTeX local encontrado.");
         return Ok(());
     }
 
-    // Tenta usar TeX Live do sistema
-    if check_system_texlive() {
-        log::info!("Usando TeX Live do sistema");
+    // 2. TeX Live do sistema?
+    if system_texlive_bin().is_some() {
+        log::info!("TeX Live do sistema encontrado.");
         return Ok(());
     }
 
-    // Baixa e instala TinyTeX
-    log::info!("TinyTeX não encontrado. Baixando...");
-    download_and_install_tinytex().await?;
-    
+    // 3. Precisa instalar — emite progresso ao frontend
+    log::info!("TeX Live não encontrado. Iniciando download do TinyTeX...");
+    emit_progress(app, 0, "Iniciando download do TinyTeX...");
+
+    download_tinytex(app).await?;
+    install_required_packages(app)?;
+
+    emit_progress(app, 100, "TinyTeX pronto!");
     Ok(())
 }
 
-fn check_system_texlive() -> bool {
-    let candidates = if cfg!(target_os = "windows") {
-        vec![
-            PathBuf::from("C:\\texlive\\2026\\bin\\win32"),
-            PathBuf::from("C:\\texlive\\2025\\bin\\win32"),
-        ]
+async fn download_tinytex(app: Option<&AppHandle>) -> Result<()> {
+    let tinytex_path = tinytex_dir();
+    std::fs::create_dir_all(&tinytex_path)?;
+
+    let archive_name = if cfg!(target_os = "windows") {
+        "tinytex.zip"
     } else {
-        vec![
-            PathBuf::from("/usr/local/texlive/2026/bin/x86_64-linux"),
-            PathBuf::from("/usr/local/texlive/2025/bin/x86_64-linux"),
-        ]
+        "tinytex.tar.gz"
     };
+    let archive_path = tinytex_path.join(archive_name);
 
-    for candidate in candidates {
-        let pdflatex = if cfg!(target_os = "windows") {
-            candidate.join("pdflatex.exe")
-        } else {
-            candidate.join("pdflatex")
-        };
-        if pdflatex.exists() {
-            return true;
-        }
-    }
-    false
-}
+    emit_progress(app, 5, "Conectando ao servidor...");
 
-async fn download_and_install_tinytex() -> Result<()> {
-    let texlive_path = texlive_dir();
-    std::fs::create_dir_all(&texlive_path)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()?;
 
-    let zip_path = texlive_path.join("tinytex.zip");
-
-    // Download (inclui a versão para evitar aviso de dead_code)
-    log::info!("Baixando TinyTeX {} de {}", TINYTEX_VERSION, TINYTEX_URL);
-    let bytes = reqwest::Client::new()
+    // Faz HEAD para pegar o Content-Length (após redirect)
+    let response = client
         .get(TINYTEX_URL)
         .send()
-        .await?
-        .bytes()
-        .await?;
+        .await
+        .map_err(|e| anyhow!("Falha ao conectar para baixar TinyTeX: {}", e))?;
 
-    std::fs::write(&zip_path, bytes)?;
-    log::info!("TinyTeX baixado: {}", zip_path.display());
-
-    // Extração
-    extract_zip(&zip_path, &texlive_path)?;
-    std::fs::remove_file(&zip_path)?;
-
-    // Valida
-    let pdflatex = if cfg!(target_os = "windows") {
-        texlive_bin_path().join("pdflatex.exe")
-    } else {
-        texlive_bin_path().join("pdflatex")
-    };
-
-    if !pdflatex.exists() {
+    if !response.status().is_success() {
         return Err(anyhow!(
-            "TinyTeX extraído mas pdflatex não encontrado em {:?}",
-            pdflatex
+            "Servidor retornou {} ao baixar TinyTeX.",
+            response.status()
         ));
     }
 
-    log::info!("TinyTeX instalado com sucesso em {:?}", texlive_path);
+    let total = response.content_length().unwrap_or(0);
+    log::info!("Baixando TinyTeX: {} bytes de {}", total, TINYTEX_URL);
+    emit_progress(app, 8, &format!("Baixando TinyTeX ({} MB)...", total / 1_000_000 + 1));
+
+    // Stream com progresso
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut file = std::fs::File::create(&archive_path)
+        .map_err(|e| anyhow!("Não foi possível criar arquivo temporário: {}", e))?;
+
+    let mut downloaded: u64 = 0;
+    let mut last_pct = 0u8;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow!("Erro durante download: {}", e))?;
+        use std::io::Write;
+        file.write_all(&chunk)?;
+        downloaded += chunk.len() as u64;
+
+        if total > 0 {
+            // Mapeia 8%–70% para o progresso do download
+            let pct = (8 + (downloaded * 62 / total)) as u8;
+            if pct > last_pct {
+                last_pct = pct;
+                emit_progress(
+                    app,
+                    pct,
+                    &format!(
+                        "Baixando TinyTeX... {}/{} MB",
+                        downloaded / 1_000_000,
+                        total / 1_000_000
+                    ),
+                );
+            }
+        }
+    }
+    drop(file);
+
+    log::info!("Download concluído: {:?}", archive_path);
+    emit_progress(app, 70, "Extraindo TinyTeX...");
+
+    extract_archive(&archive_path, &tinytex_path)?;
+    std::fs::remove_file(&archive_path).ok();
+
+    // Valida que pdflatex está acessível após extração
+    if tinytex_bin_dir().is_none() {
+        // Tenta listar o que foi extraído para debug
+        let listing: Vec<_> = std::fs::read_dir(&tinytex_path)
+            .ok()
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "TinyTeX extraído mas pdflatex não encontrado. \
+             Conteúdo de {:?}: {:?}",
+            tinytex_path,
+            listing
+        ));
+    }
+
+    emit_progress(app, 80, "TinyTeX extraído. Instalando pacotes...");
+    log::info!("TinyTeX instalado em {:?}", tinytex_dir());
     Ok(())
 }
 
-fn extract_zip(zip_path: &Path, extract_to: &Path) -> Result<()> {
+fn install_required_packages(app: Option<&AppHandle>) -> Result<()> {
+    let tlmgr = tex_command("tlmgr");
+    if !tlmgr.exists() {
+        log::warn!("tlmgr não encontrado, pulando instalação de pacotes.");
+        return Ok(());
+    }
+
+    emit_progress(app, 82, "Atualizando tlmgr...");
+
+    // Atualiza o próprio tlmgr primeiro
+    let _ = Command::new(&tlmgr)
+        .args(["update", "--self", "--no-auto-install"])
+        .output();
+
+    let total = REQUIRED_PACKAGES.len();
+    for (i, pkg) in REQUIRED_PACKAGES.iter().enumerate() {
+        let pct = 83u8 + ((i as u8 * 15) / total as u8);
+        emit_progress(app, pct, &format!("Instalando pacote LaTeX: {}...", pkg));
+        log::info!("tlmgr install {}", pkg);
+
+        let out = Command::new(&tlmgr)
+            .args(["install", pkg])
+            .output();
+
+        match out {
+            Ok(o) if o.status.success() => log::info!("Pacote {} instalado.", pkg),
+            Ok(o) => log::warn!(
+                "tlmgr install {} retornou erro: {}",
+                pkg,
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => log::warn!("Falha ao executar tlmgr para {}: {}", pkg, e),
+        }
+    }
+
+    emit_progress(app, 98, "Pacotes instalados.");
+    Ok(())
+}
+
+fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        // Usa PowerShell para extrair no Windows
         let ps_cmd = format!(
             r#"Expand-Archive -Path "{}" -DestinationPath "{}" -Force"#,
-            zip_path.display(),
-            extract_to.display()
+            archive.display(),
+            dest.display()
         );
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps_cmd])
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .output()?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Erro ao extrair ZIP: {}", err));
+        if !out.status.success() {
+            return Err(anyhow!(
+                "Erro ao extrair ZIP: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let output = Command::new("unzip")
-            .args(["-o", zip_path.to_str().unwrap(), "-d", extract_to.to_str().unwrap()])
+        let out = Command::new("tar")
+            .args([
+                "-xzf",
+                archive.to_str().unwrap(),
+                "-C",
+                dest.to_str().unwrap(),
+            ])
             .output()?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Erro ao extrair ZIP: {}", err));
+        if !out.status.success() {
+            return Err(anyhow!(
+                "Erro ao extrair tar.gz: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
         }
     }
 
     Ok(())
+}
+
+fn emit_progress(app: Option<&AppHandle>, pct: u8, message: &str) {
+    log::info!("[texlive {}%] {}", pct, message);
+    if let Some(app) = app {
+        app.emit(
+            "texlive_progress",
+            serde_json::json!({ "pct": pct, "message": message }),
+        )
+        .ok();
+    }
 }
