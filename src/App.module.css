@@ -104,3 +104,68 @@
   overflow-y: auto;
   background: var(--bg);
 }
+
+/* ── Overlay instalação TinyTeX ─────────────────────────────────────────── */
+
+.texOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.texCard {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 40px;
+  width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
+}
+
+.texTitle {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.texMessage {
+  font-size: 13px;
+  color: var(--text2);
+  min-height: 18px;
+}
+
+.texBarWrap {
+  height: 6px;
+  background: var(--bg3);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.texBar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 99px;
+  transition: width 0.4s ease;
+}
+
+.texPct {
+  font-size: 12px;
+  color: var(--text3);
+  text-align: right;
+}
+
+.texNote {
+  font-size: 11px;
+  color: var(--text3);
+  line-height: 1.5;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
