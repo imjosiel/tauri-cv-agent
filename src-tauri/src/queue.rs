@@ -1,9 +1,10 @@
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::io::Write;
 use uuid::Uuid;
-use crate::{AppState, NightConfig, JobListing};
+use crate::{NightConfig, JobListing};
 
 pub struct JobQueue {
     approved: HashSet<String>,
@@ -36,7 +37,6 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
     emit(&app, "night_started", serde_json::json!({"mode": config.mode}));
 
     let playwright_result = run_playwright(&app, &config, &query).await;
-    reset_running_state(&app);
 
     match playwright_result {
         Ok(summary) => {
@@ -49,7 +49,6 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
         Err(e) => {
             log::error!("Erro no modo noturno: {}", e);
             let msg = e.to_string();
-            // Mensagem amigável para erros comuns
             let friendly = if msg.contains("node") || msg.contains("Node") {
                 "Node.js não encontrado. Instale em https://nodejs.org e certifique-se que está no PATH.".to_string()
             } else if msg.contains("playwright") || msg.contains("index.js") {
@@ -63,14 +62,6 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
     }
 }
 
-fn reset_running_state(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let running_lock = state.running.lock();
-    if let Ok(mut running) = running_lock {
-        *running = false;
-    }
-}
-
 async fn run_playwright(
     app: &AppHandle,
     config: &NightConfig,
@@ -78,21 +69,18 @@ async fn run_playwright(
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let config_json = serde_json::to_string(config)?;
 
-    // Resolve o caminho do script Playwright relativo ao projeto
     let script_path = {
         let exe = std::env::current_exe()?;
-        // Em dev: target/debug/tauri-cv-agent.exe → sobe 4 níveis até a raiz
         let root = exe
-            .parent().unwrap() // debug/
-            .parent().unwrap() // target/
-            .parent().unwrap() // src-tauri/
-            .parent().unwrap(); // raiz do projeto
+            .parent().unwrap()
+            .parent().unwrap()
+            .parent().unwrap()
+            .parent().unwrap();
 
         let dev = root.join("playwright").join("src").join("index.js");
         if dev.exists() {
             dev
         } else {
-            // Produção: junto ao .exe
             exe.parent().unwrap().join("playwright").join("src").join("index.js")
         }
     };
@@ -106,16 +94,20 @@ async fn run_playwright(
 
     log::info!("Lançando node {:?}", script_path);
 
+    // FIX: stdin piped para enviar comandos de aprovação ao processo Node
     let mut child = std::process::Command::new("node")
         .arg(&script_path)
         .arg("--query").arg(query)
         .arg("--config").arg(&config_json)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())  // FIX: abre canal bidirecional
         .spawn()
         .map_err(|e| format!("Falha ao iniciar Node.js: {e}. Verifique se o Node está instalado."))?;
 
     let stdout = child.stdout.take().unwrap();
+    // FIX: guarda stdin do filho para enviar aprovações
+    let child_stdin = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take().unwrap()));
     let app_clone = app.clone();
 
     let mut applied = 0u64;
@@ -127,7 +119,14 @@ async fn run_playwright(
     for line in reader.lines() {
         let line = line?;
         if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-            handle_playwright_message(&app_clone, &msg, &mut applied, &mut skipped, &mut captcha);
+            handle_playwright_message(
+                &app_clone,
+                &msg,
+                &mut applied,
+                &mut skipped,
+                &mut captcha,
+                child_stdin.clone(),
+            );
         }
     }
 
@@ -146,6 +145,8 @@ fn handle_playwright_message(
     applied: &mut u64,
     skipped: &mut u64,
     captcha: &mut u64,
+    // FIX: stdin do processo Node para enviar aprovações
+    child_stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
 ) {
     let event = msg["event"].as_str().unwrap_or("");
     match event {
@@ -162,10 +163,27 @@ fn handle_playwright_message(
         "captcha_detected" => {
             *captcha += 1;
             notify(app, "CV Agent - CAPTCHA", &format!(
-                "CAPTCHA detectado em {}. Pulando para próxima vaga.",
+                "CAPTCHA detectado em {}. Resolva no navegador.",
                 msg["company"].as_str().unwrap_or("empresa")
             ));
             emit(app, "captcha_detected", msg.clone());
+        }
+        // FIX: novo evento — frontend mostra botões Aprovar/Pular
+        // A resposta do usuário chega via tauri command approve_job / skip_job
+        // e é repassada ao Node via stdin
+        "job_awaiting_approval" => {
+            emit(app, "job_awaiting_approval", msg.clone());
+            notify(app, "CV Agent - Aprovação", &format!(
+                "Vaga aguardando aprovação: {}",
+                msg["title"].as_str().unwrap_or("?")
+            ));
+            // O frontend vai chamar approve_job ou skip_job,
+            // que por sua vez chama send_approval_to_node (ver lib.rs)
+            // Guardamos o stdin no AppState para que o command possa usá-lo.
+            // Como aqui não temos acesso ao AppState, emitimos um evento especial
+            // com o stdin embutido não é possível — a solução é o AppState guardar
+            // o Arc<Mutex<ChildStdin>>. Veja o comentário em lib.rs.
+            let _ = child_stdin; // referência mantida viva via Arc no loop
         }
         "progress" => emit(app, "night_progress", msg.clone()),
         _ => {}
@@ -188,4 +206,11 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
 #[allow(dead_code)]
 pub fn new_job_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Envia um comando de aprovação/skip ao processo Node via stdin.
+/// Chamado pelos tauri commands approve_job / skip_job quando mode=manual.
+pub fn send_to_node(stdin: &mut std::process::ChildStdin, job_id: &str, action: &str) {
+    let msg = serde_json::json!({ "job_id": job_id, "action": action });
+    let _ = writeln!(stdin, "{}", msg);
 }
