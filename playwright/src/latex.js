@@ -1,35 +1,68 @@
 // playwright/src/latex.js
+//
+// Compila um .tex em PDF usando o TeX Live disponível no sistema.
+// Prioridade:
+//   1. TinyTeX instalado pelo cv-agent (%APPDATA%/cv-agent/tinytex)
+//   2. TeX Live do sistema (C:\texlive\*, /usr/local/texlive/*)
+//   3. pdflatex no PATH
+
 import { mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync } from "fs";
 import { join, extname, delimiter } from "path";
 import { execSync } from "child_process";
 
-const DATA_DIR = `${process.env.APPDATA ?? "."}/cv-agent`;
+const DATA_DIR = join(process.env.APPDATA ?? process.env.HOME ?? ".", "cv-agent");
 const OUT_DIR  = join(DATA_DIR, "curriculo", "output");
 
-function findTexLiveBin() {
+// Diretórios de binários TinyTeX conhecidos (mesmo mapeamento do texlive.rs)
+function findTexBin() {
   const candidates = [];
+
   if (process.platform === "win32") {
-    if (process.env.TEXLIVE) candidates.push(join(process.env.TEXLIVE, "bin", "win32"));
-    if (process.env.TEXLIVE_ROOT) candidates.push(join(process.env.TEXLIVE_ROOT, "bin", "win32"));
-    if (process.env.TEXLIVE_HOME) candidates.push(join(process.env.TEXLIVE_HOME, "bin", "win32"));
-    candidates.push(join("C:", "texlive", "2026", "bin", "win32"));
-    candidates.push(join("C:", "texlive", "2025", "bin", "win32"));
-    candidates.push(join("C:", "texlive", "2024", "bin", "win32"));
+    const tinytex = join(DATA_DIR, "tinytex");
+    candidates.push(
+      join(tinytex, "bin", "windows"),
+      join(tinytex, "bin", "win32"),
+      join(tinytex, "TinyTeX", "bin", "windows"),
+      join(tinytex, "TinyTeX", "bin", "win32"),
+    );
+    // TeX Live do sistema — testa anos de 2030 até 2020
+    for (let y = 2030; y >= 2020; y--) {
+      candidates.push(
+        join("C:", "texlive", String(y), "bin", "windows"),
+        join("C:", "texlive", String(y), "bin", "win32"),
+      );
+    }
   } else {
-    if (process.env.TEXLIVE) candidates.push(join(process.env.TEXLIVE, "bin", "x86_64-linux"));
-    if (process.env.TEXLIVE_ROOT) candidates.push(join(process.env.TEXLIVE_ROOT, "bin", "x86_64-linux"));
-    candidates.push("/usr/local/texlive/2026/bin/x86_64-linux");
-    candidates.push("/usr/local/texlive/2025/bin/x86_64-linux");
+    const tinytex = join(DATA_DIR, "tinytex");
+    candidates.push(
+      join(tinytex, "bin", "x86_64-linux"),
+      join(tinytex, "bin", "aarch64-linux"),
+      join(tinytex, "bin", "universal-darwin"),
+      join(tinytex, "TinyTeX", "bin", "x86_64-linux"),
+      join(tinytex, "TinyTeX", "bin", "universal-darwin"),
+    );
+    for (let y = 2030; y >= 2020; y--) {
+      candidates.push(
+        `/usr/local/texlive/${y}/bin/x86_64-linux`,
+        `/usr/local/texlive/${y}/bin/aarch64-linux`,
+        `/usr/local/texlive/${y}/bin/universal-darwin`,
+      );
+    }
+    candidates.push("/usr/bin", "/usr/local/bin");
   }
 
-  return candidates.find((bin) => existsSync(join(bin, process.platform === "win32" ? "pdflatex.exe" : "pdflatex"))) ?? null;
+  const pdflatexExe = process.platform === "win32" ? "pdflatex.exe" : "pdflatex";
+  return candidates.find((bin) => existsSync(join(bin, pdflatexExe))) ?? null;
 }
 
-function prepareTexEnv() {
+function buildEnv() {
   const env = { ...process.env };
-  const texBin = findTexLiveBin();
+  const texBin = findTexBin();
   if (texBin) {
     env.PATH = `${texBin}${delimiter}${env.PATH ?? ""}`;
+    console.log(`[latex] Usando TeX de: ${texBin}`);
+  } else {
+    console.warn("[latex] TeX Live não encontrado no PATH nem nos diretórios conhecidos.");
   }
   return env;
 }
@@ -44,95 +77,89 @@ export async function compileLaTeX(texContent, jobId) {
   writeFileSync(texPath, texContent, "utf8");
   copyAssetsToOutput(jobDir);
 
-  // Tenta latexmk primeiro (mais rápido), fallback para pdflatex
+  const env = buildEnv();
+  const opts = { timeout: 120_000, stdio: "pipe", env };
+
+  // Tenta latexmk (melhor para múltiplas passagens automáticas)
+  let compiled = false;
   try {
     execSync(
       `latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir="${jobDir}" "${texPath}"`,
-      { timeout: 60000, stdio: "pipe", env: prepareTexEnv() }
+      opts,
     );
+    compiled = true;
   } catch {
-    try {
-      execSync(
-        `pdflatex -interaction=nonstopmode -halt-on-error -output-directory="${jobDir}" "${texPath}"`,
-        { timeout: 60000, stdio: "pipe", env: prepareTexEnv() }
-      );
-      // Segunda passagem para referências
+    // latexmk não disponível ou falhou — tenta pdflatex direto
+  }
+
+  if (!compiled) {
+    // Duas passagens para resolver referências cruzadas
+    for (let pass = 1; pass <= 2; pass++) {
       try {
         execSync(
-          `pdflatex -interaction=nonstopmode -output-directory="${jobDir}" "${texPath}"`,
-          { timeout: 60000, stdio: "pipe", env: prepareTexEnv() }
+          `pdflatex -interaction=nonstopmode -halt-on-error -output-directory="${jobDir}" "${texPath}"`,
+          opts,
         );
-      } catch (e3) {
-        const stderr3 = e3.stderr?.toString?.() ?? "";
-        const stdout3 = e3.stdout?.toString?.() ?? "";
-        const detail3 = stderr3 || stdout3 || String(e3);
-        throw new Error(
-          "Erro na segunda passagem pdflatex:\n" +
-          detail3.slice(0, 20000)
-        );
+      } catch (err) {
+        const raw = (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? "") || String(err);
+
+        // Extrai linhas de erro LaTeX para mensagem limpa
+        const errorLines = raw
+          .split("\n")
+          .filter((l) => l.startsWith("!") || l.includes("Error") || l.includes("Fatal"))
+          .slice(0, 6)
+          .join("\n");
+
+        const summary = errorLines || raw.slice(0, 1000);
+
+        if (pass === 1) {
+          throw new Error(
+            `Erro na compilação LaTeX (passagem ${pass}):\n${summary}\n\n` +
+            `Se o pdflatex não foi encontrado, aguarde o cv-agent instalar o TinyTeX ` +
+            `na primeira compilação via interface.`,
+          );
+        }
+        // Na segunda passagem, alguns erros de referência são esperados — ignora
+        console.warn(`[latex] Aviso na passagem 2 (pode ser inofensivo): ${summary.slice(0, 200)}`);
       }
-    } catch (e2) {
-      const stderr = e2.stderr?.toString?.() ?? "";
-      const stdout = e2.stdout?.toString?.() ?? "";
-      const detail = stderr || stdout || String(e2);
-      throw new Error(
-        "TeX Live não encontrado ou erro de compilação. " +
-        "Instale em: https://tug.org/texlive/windows.html\n" +
-        detail.slice(0, 20000)
-      );
     }
+  }
+
+  if (!existsSync(pdfPath)) {
+    throw new Error(`PDF não gerado em ${pdfPath}. Verifique o log em ${jobDir}/curriculo.log`);
   }
 
   return pdfPath;
 }
 
 function copyAssetsToOutput(jobDir) {
-  const templatesDir = join(process.env.APPDATA ?? ".", "cv-agent", "curriculo", "templates");
-  if (!existsSync(templatesDir)) {
-    console.warn(`Templates dir não existe: ${templatesDir}`);
-    return;
+  const templatesDir = join(DATA_DIR, "curriculo", "templates");
+  if (!existsSync(templatesDir)) return;
+
+  const supported = new Set([".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty", ".ttf", ".otf"]);
+  let count = 0;
+
+  function copyFile(src, name) {
+    try {
+      copyFileSync(src, join(jobDir, name));
+      count++;
+    } catch (e) {
+      console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`);
+    }
   }
 
-  const supported = [".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty"];
-  let copiedCount = 0;
-
-  try {
-    for (const entry of readdirSync(templatesDir, { withFileTypes: true })) {
-      const srcPath = join(templatesDir, entry.name);
-      if (entry.isDirectory()) {
-        for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
-          if (!asset.isFile()) continue;
-          const ext = extname(asset.name).toLowerCase();
-          if (!supported.includes(ext)) continue;
-          try {
-            const srcFile = join(srcPath, asset.name);
-            const destFile = join(jobDir, asset.name);
-            copyFileSync(srcFile, destFile);
-            copiedCount++;
-            if (ext === ".cls" || ext === ".sty") {
-              console.log(`Copiado: ${asset.name} → ${destFile}`);
-            }
-          } catch (err) {
-            console.warn(`Erro ao copiar ${asset.name}: ${err.message}`);
-          }
-        }
-      } else if (entry.isFile()) {
-        const ext = extname(entry.name).toLowerCase();
-        if (!supported.includes(ext)) continue;
-        try {
-          const destFile = join(jobDir, entry.name);
-          copyFileSync(srcPath, destFile);
-          copiedCount++;
-          if (ext === ".cls" || ext === ".sty") {
-            console.log(`Copiado: ${entry.name} → ${destFile}`);
-          }
-        } catch (err) {
-          console.warn(`Erro ao copiar ${entry.name}: ${err.message}`);
+  for (const entry of readdirSync(templatesDir, { withFileTypes: true })) {
+    const srcPath = join(templatesDir, entry.name);
+    if (entry.isDirectory()) {
+      for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
+        if (asset.isFile() && supported.has(extname(asset.name).toLowerCase())) {
+          copyFile(join(srcPath, asset.name), asset.name);
         }
       }
+    } else if (entry.isFile() && supported.has(extname(entry.name).toLowerCase())) {
+      copyFile(srcPath, entry.name);
     }
-    console.log(`Assets copiados: ${copiedCount} arquivos para ${jobDir}`);
-  } catch (err) {
-    console.error(`Erro geral em copyAssetsToOutput: ${err.message}`);
   }
+
+  console.log(`[latex] ${count} assets copiados para ${jobDir}`);
 }
