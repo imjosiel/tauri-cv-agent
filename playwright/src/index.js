@@ -5,7 +5,7 @@ import { parseArgs } from "./args.js";
 import { runSearch } from "./orchestrator.js";
 import { mkdirSync, existsSync } from "fs";
 import { join } from "path";
-import { spawn, execSync } from "child_process";
+import { spawn } from "child_process";
 
 const { query, config } = parseArgs(process.argv.slice(2));
 
@@ -27,7 +27,6 @@ function findEdge() {
   return paths.find(p => existsSync(p)) ?? null;
 }
 
-// Verifica se já tem uma instância do Edge com CDP rodando na porta
 async function isCdpRunning(port) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/json/version`);
@@ -37,7 +36,6 @@ async function isCdpRunning(port) {
   }
 }
 
-// Aguarda o CDP ficar disponível (até timeoutMs)
 async function waitForCdp(port, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -61,7 +59,6 @@ async function main() {
   }
   log(`Edge encontrado: ${edgePath}`);
 
-  // Perfil do CV Agent — mantém sessão entre execuções
   const profileDir = join(
     process.env.APPDATA ?? ".",
     "cv-agent", "browser-profile"
@@ -74,7 +71,6 @@ async function main() {
   if (!alreadyRunning) {
     log(`Abrindo Edge com CDP na porta ${CDP_PORT}...`);
 
-    // Abre o Edge SEM flags de automação — só o CDP port e o perfil
     edgeProcess = spawn(edgePath, [
       `--remote-debugging-port=${CDP_PORT}`,
       `--user-data-dir=${profileDir}`,
@@ -85,6 +81,11 @@ async function main() {
     ], {
       detached: false,
       stdio: "ignore",
+    });
+
+    // FIX: não mata o Edge se o processo sair inesperadamente
+    edgeProcess.on("exit", (code) => {
+      log(`Edge encerrou com código ${code}`);
     });
 
     log("Aguardando CDP ficar disponível...");
@@ -102,7 +103,6 @@ async function main() {
 
   emit("progress", { message: "Edge aberto, conectando..." });
 
-  // Conecta no Edge via CDP — sem launchPersistentContext, sem flags de automação
   let browser;
   try {
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`);
@@ -115,12 +115,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Usa o contexto padrão (a sessão real do usuário)
   const context = browser.contexts()[0] ?? await browser.newContext();
 
   emit("progress", { message: "Conectado. Iniciando busca..." });
-
-  // Pausa humana
   await new Promise(r => setTimeout(r, 1000 + Math.random() * 1000));
 
   try {
@@ -129,9 +126,19 @@ async function main() {
     log(`Erro na busca: ${err.message}\n${err.stack}`);
     emit("night_error", { error: err.message });
   } finally {
-    // Desconecta mas não fecha o Edge — o usuário pode continuar usando
+    // FIX: desconecta o Playwright mas NÃO mata o Edge.
+    // O usuário pode ainda estar vendo a tela ou resolvendo um CAPTCHA.
+    // O Edge ficará aberto até o usuário fechar manualmente.
     await browser.close().catch(() => {});
-    if (edgeProcess) edgeProcess.kill();
+    log("Playwright desconectado. Edge continua aberto para uso do usuário.");
+
+    // Só mata o processo Edge se ele foi iniciado por NÓS e
+    // stop_on_captcha=false (sem necessidade de interação manual)
+    if (edgeProcess && !config.stop_on_captcha) {
+      // Aguarda 3s para garantir que a última screenshot foi tirada
+      await new Promise(r => setTimeout(r, 3000));
+      edgeProcess.kill();
+    }
   }
 }
 
