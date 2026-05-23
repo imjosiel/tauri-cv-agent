@@ -51,11 +51,10 @@ pub fn read_template(name: &str) -> Result<String> {
 }
 
 /// Compila um .tex em PDF.
-/// `app` é usado para emitir eventos de progresso durante a instalação do TinyTeX
-/// (somente na primeira vez que o usuário compilar).
+/// `app` recebe eventos de progresso durante a instalação do TinyTeX
+/// (ocorre apenas na primeira compilação, quando o TinyTeX ainda não está instalado).
 pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -> Result<String> {
-    // Garante TeX Live disponível — na primeira vez pode demorar (download TinyTeX)
-    texlive::ensure_texlive(app).await?;
+    texlive::ensure_tinytex(app).await?;
 
     let out_dir = output_dir().join(job_id);
     std::fs::create_dir_all(&out_dir)?;
@@ -64,15 +63,13 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     let pdf_path = out_dir.join("curriculo.pdf");
 
     std::fs::write(&tex_path, tex_content)?;
-
-    // Copia .cls, .sty e assets de todos os pacotes para o diretório de saída
     copy_assets_to_output(&out_dir)?;
 
-    // Tenta latexmk primeiro (mais robusto com referências cruzadas),
-    // fallback para pdflatex com 2 passagens
-    let compiled = try_latexmk(&out_dir).or_else(|_| try_pdflatex(&out_dir))?;
+    // latexmk é preferível (resolve referências cruzadas automaticamente);
+    // fallback para pdflatex com duas passagens manuais.
+    let ok = try_latexmk(&out_dir).or_else(|_| try_pdflatex(&out_dir))?;
 
-    if !compiled {
+    if !ok {
         return Err(anyhow!("Compilação LaTeX falhou sem mensagem de erro específica."));
     }
 
@@ -84,20 +81,14 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
 }
 
 fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
-    let cmd = texlive::tex_command("latexmk");
-    log::info!("Executando latexmk em {:?}", out_dir);
-
-    let output = Command::new(&cmd)
+    let output = Command::new(texlive::tex_command("latexmk"))
         .args(["-pdf", "-interaction=nonstopmode", "-halt-on-error", "curriculo.tex"])
         .current_dir(out_dir)
         .output()
         .map_err(|e| anyhow!("latexmk não disponível: {}", e))?;
 
     if !output.status.success() {
-        log::warn!(
-            "latexmk falhou:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+        log::warn!("latexmk falhou:\n{}", String::from_utf8_lossy(&output.stdout));
     }
 
     Ok(output.status.success())
@@ -105,30 +96,21 @@ fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
 
 fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
     for pass in 0..2 {
-        let cmd = texlive::tex_command("pdflatex");
-        log::info!("pdflatex passagem {} em {:?}", pass + 1, out_dir);
-
-        let output = Command::new(&cmd)
+        let output = Command::new(texlive::tex_command("pdflatex"))
             .args(["-interaction=nonstopmode", "-halt-on-error", "curriculo.tex"])
             .current_dir(out_dir)
             .output()
-            .map_err(|_| anyhow!(
-                "pdflatex não encontrado. Verifique se o TinyTeX foi instalado corretamente."
-            ))?;
+            .map_err(|_| anyhow!("pdflatex não encontrado. Verifique se o TinyTeX foi instalado corretamente."))?;
 
         if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("pdflatex stdout:\n{}", stdout);
-            log::error!("pdflatex stderr:\n{}", stderr);
-
-            let detail = if !stdout.is_empty() {
-                stdout.to_string()
-            } else {
-                stderr.to_string()
+            let detail = {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.is_empty() { stdout.to_string() } else { stderr.to_string() }
             };
 
-            // Extrai apenas as linhas de erro do log LaTeX para mensagem limpa
+            log::error!("pdflatex (pass {}) falhou:\n{}", pass + 1, detail);
+
             let error_lines: Vec<&str> = detail
                 .lines()
                 .filter(|l| l.starts_with('!') || l.contains("Error") || l.contains("Fatal"))
@@ -148,8 +130,8 @@ fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
     Ok(true)
 }
 
-/// Copia todos os assets (.cls, .sty, imagens) de todos os pacotes salvos
-/// para o diretório de saída, para que o pdflatex encontre os arquivos.
+/// Copia .cls, .sty, imagens e fontes de todos os pacotes salvos
+/// para o diretório de saída, onde o pdflatex vai procurá-los.
 fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
     let tpl_dir = templates_dir();
     if !tpl_dir.exists() {
