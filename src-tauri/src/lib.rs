@@ -104,8 +104,12 @@ async fn edit_resume(
 }
 
 #[tauri::command]
-async fn compile_latex(tex_content: String, job_id: String) -> Result<String, String> {
-    latex::compile(&tex_content, &job_id)
+async fn compile_latex(
+    tex_content: String,
+    job_id: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    latex::compile(&tex_content, &job_id, Some(&app))
         .await
         .map_err(|e| e.to_string())
 }
