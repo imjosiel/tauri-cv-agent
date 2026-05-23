@@ -40,6 +40,21 @@ export interface LiveEvent {
   ts: number;
 }
 
+// Tipos de currículo — espelham SavedResumePackage do Rust
+export interface ResumeAsset {
+  filename: string;
+  data_url?: string;
+  present: boolean;
+  placeholder: boolean;
+}
+
+export interface ResumePackage {
+  name: string;
+  tex_content: string;
+  assets: ResumeAsset[];
+  saved_at: string;
+}
+
 interface AppStore {
   ollama: OllamaStatus | null;
   running: boolean;
@@ -47,12 +62,22 @@ interface AppStore {
   liveEvents: LiveEvent[];
   jobs: JobListing[];
 
+  // Currículos — persistidos no disco, carregados uma vez na montagem do App
+  resumePackages: ResumePackage[];
+  resumesLoaded: boolean;
+
   setOllama: (s: OllamaStatus) => void;
   setRunning: (r: boolean) => void;
   setNightConfig: (c: Partial<NightConfig>) => void;
   addEvent: (type: string, payload: any) => void;
   setJobs: (jobs: JobListing[]) => void;
   clearEvents: () => void;
+
+  setResumePackages: (pkgs: ResumePackage[]) => void;
+  addResumePackage: (pkg: ResumePackage) => void;
+  updateResumePackage: (name: string, pkg: Partial<ResumePackage>) => void;
+  deleteResumePackage: (name: string) => void;
+  setResumesLoaded: (v: boolean) => void;
 }
 
 const DEFAULT_CONFIG: NightConfig = {
@@ -72,6 +97,8 @@ export const useAppStore = create<AppStore>((set) => ({
   nightConfig: DEFAULT_CONFIG,
   liveEvents: [],
   jobs: [],
+  resumePackages: [],
+  resumesLoaded: false,
 
   setOllama: (ollama) => set({ ollama }),
   setRunning: (running) => set({ running }),
@@ -83,4 +110,21 @@ export const useAppStore = create<AppStore>((set) => ({
     })),
   setJobs: (jobs) => set({ jobs }),
   clearEvents: () => set({ liveEvents: [] }),
+
+  setResumePackages: (resumePackages) => set({ resumePackages }),
+  addResumePackage: (pkg) =>
+    set((s) => ({
+      resumePackages: [...s.resumePackages.filter((p) => p.name !== pkg.name), pkg],
+    })),
+  updateResumePackage: (name, partial) =>
+    set((s) => ({
+      resumePackages: s.resumePackages.map((p) =>
+        p.name === name ? { ...p, ...partial } : p
+      ),
+    })),
+  deleteResumePackage: (name) =>
+    set((s) => ({
+      resumePackages: s.resumePackages.filter((p) => p.name !== name),
+    })),
+  setResumesLoaded: (resumesLoaded) => set({ resumesLoaded }),
 }));
