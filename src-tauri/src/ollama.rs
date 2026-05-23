@@ -1,18 +1,15 @@
 // src-tauri/src/ollama.rs
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use crate::OllamaStatus;
 
 const OLLAMA_URL: &str = "http://localhost:11434";
 
-// Marcadores que delimitam o bloco LaTeX na resposta do modelo.
-// Escolhidos para serem improvável de aparecer no próprio LaTeX.
 const TEX_START: &str = "<<<TEX_START>>>";
-const TEX_END: &str = "<<<TEX_END>>>";
+const TEX_END:   &str = "<<<TEX_END>>>";
 
 pub async fn check_status() -> Result<OllamaStatus> {
     let client = reqwest::Client::new();
-
     let resp = client
         .get(format!("{}/api/tags", OLLAMA_URL))
         .timeout(std::time::Duration::from_secs(3))
@@ -29,10 +26,7 @@ pub async fn check_status() -> Result<OllamaStatus> {
                 .filter_map(|m| m["name"].as_str().map(String::from))
                 .collect();
 
-            let preferred = [
-                "qwen2.5:14b", "qwen2.5:7b", "qwen2.5:3b",
-                "llama3.2:3b", "llama3:8b",
-            ];
+            let preferred = ["qwen2.5:14b", "qwen2.5:7b", "qwen2.5:3b", "llama3.2:3b", "llama3:8b"];
             let model = preferred
                 .iter()
                 .find(|&&p| models.iter().any(|m| m.starts_with(p)))
@@ -41,11 +35,7 @@ pub async fn check_status() -> Result<OllamaStatus> {
 
             Ok(OllamaStatus { connected: true, model, models_available: models })
         }
-        _ => Ok(OllamaStatus {
-            connected: false,
-            model: None,
-            models_available: vec![],
-        }),
+        _ => Ok(OllamaStatus { connected: false, model: None, models_available: vec![] }),
     }
 }
 
@@ -86,16 +76,9 @@ pub async fn edit_resume(
     model: &str,
     _job_id: &str,
 ) -> Result<Value> {
-    // ─────────────────────────────────────────────────────────────────────────
-    // ESTRATÉGIA: o LaTeX editado NÃO fica dentro do JSON.
-    //
-    // Por que? JSON exige que barras invertidas sejam escapadas (\ → \\).
-    // LLMs frequentemente "sobre-escapam" (\ → \\\\), corrompendo o LaTeX.
-    // A solução é pedir ao modelo um formato misto:
-    //   - metadados em JSON (changes, cover_letter)
-    //   - o .tex delimitado por marcadores fora do JSON
-    // Depois extraímos cada parte de forma independente.
-    // ─────────────────────────────────────────────────────────────────────────
+    // O LaTeX editado NÃO entra dentro do JSON para evitar o problema de
+    // over-escaping de barras invertidas por LLMs (\\ → \\\\).
+    // O modelo responde com metadados JSON + bloco LaTeX delimitado por marcadores.
     let prompt = format!(
         r#"Você é especialista em currículos LaTeX. Edite o currículo para a vaga abaixo.
 
@@ -113,43 +96,41 @@ JSON_META_START
   "cover_letter": "<carta de apresentação em português, 3 parágrafos>"
 }}
 JSON_META_END
-{TEX_START}
+{tex_start}
 <currículo LaTeX completo editado — copie e adapte o original>
-{TEX_END}
+{tex_end}
 
 CURRÍCULO ORIGINAL (LaTeX):
-{}
+{resume}
 
 DESCRIÇÃO DA VAGA:
-{}
+{job}
 
 Responda agora seguindo exatamente o formato acima."#,
-        TEX_START, TEX_END,
-        resume_tex, job_description
+        tex_start = TEX_START,
+        tex_end   = TEX_END,
+        resume    = resume_tex,
+        job       = job_description,
     );
 
     let raw = chat(model, &prompt).await?;
 
-    // Extrai o bloco LaTeX pelos marcadores
     let edited_tex = extract_between(&raw, TEX_START, TEX_END)
         .ok_or_else(|| anyhow!(
             "Modelo não retornou o bloco LaTeX com os marcadores esperados.\n\
-             Resposta recebida (primeiros 500 chars):\n{}",
+             Resposta (primeiros 500 chars):\n{}",
             &raw[..raw.len().min(500)]
         ))?
         .trim()
         .to_string();
 
-    // Sanidade básica: o LaTeX deve conter \documentclass
     if !edited_tex.contains(r"\documentclass") {
         return Err(anyhow!(
-            "Bloco LaTeX retornado parece inválido (sem \\documentclass).\n\
-             Conteúdo recebido:\n{}",
+            "Bloco LaTeX inválido (sem \\documentclass):\n{}",
             &edited_tex[..edited_tex.len().min(400)]
         ));
     }
 
-    // Extrai os metadados JSON
     let meta_json = extract_between(&raw, "JSON_META_START", "JSON_META_END")
         .map(|s| strip_markdown_fences(s.trim()))
         .unwrap_or_else(|| r#"{"changes":[],"cover_letter":""}"#.to_string());
@@ -157,34 +138,27 @@ Responda agora seguindo exatamente o formato acima."#,
     let mut meta: Value = serde_json::from_str(&meta_json)
         .unwrap_or_else(|_| json!({"changes": [], "cover_letter": ""}));
 
-    // Injeta o LaTeX no objeto de retorno
     meta["edited_tex"] = Value::String(edited_tex);
-
     Ok(meta)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Remove fences de markdown (```json ... ``` ou ``` ... ```) de uma string.
 fn strip_markdown_fences(s: &str) -> String {
     let s = s.trim();
-    let s = if s.starts_with("```") {
-        let after_fence = s.trim_start_matches('`').trim_start_matches("json").trim();
-        if let Some(end) = after_fence.rfind("```") {
-            after_fence[..end].trim()
-        } else {
-            after_fence
+    if s.starts_with("```") {
+        let inner = s.trim_start_matches('`').trim_start_matches("json").trim();
+        if let Some(end) = inner.rfind("```") {
+            return inner[..end].trim().to_string();
         }
-    } else {
-        s
-    };
+        return inner.to_string();
+    }
     s.to_string()
 }
 
-/// Extrai o conteúdo entre dois marcadores textuais.
 fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> Option<&'a str> {
     let start = text.find(start_marker)? + start_marker.len();
-    let end = text[start..].find(end_marker)? + start;
+    let end   = text[start..].find(end_marker)? + start;
     Some(&text[start..end])
 }
 
@@ -194,10 +168,7 @@ async fn chat(model: &str, prompt: &str) -> Result<String> {
         "model": model,
         "messages": [{ "role": "user", "content": prompt }],
         "stream": false,
-        "options": {
-            "temperature": 0.2,  // mais baixo = mais fiel ao formato pedido
-            "num_predict": 8192  // currículo completo pode ser longo
-        }
+        "options": { "temperature": 0.2, "num_predict": 8192 }
     });
 
     let resp = client
