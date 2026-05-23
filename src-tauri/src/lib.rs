@@ -7,7 +7,6 @@ mod ollama;
 mod latex;
 mod queue;
 mod resume;
-mod texlive;
 
 pub use db::Database;
 pub use queue::JobQueue;
@@ -25,9 +24,9 @@ pub struct NightConfig {
     pub blacklist: Vec<String>,
     pub sites: Vec<String>,
     #[serde(default)]
-    pub modality: String,        // "remote" | "hybrid" | "onsite" | "any"
+    pub modality: String,
     #[serde(default)]
-    pub locations: Vec<String>,  // ["São Paulo", "Curitiba", ...]
+    pub locations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +68,9 @@ pub struct AppState {
     pub db: Mutex<Database>,
     pub queue: Mutex<JobQueue>,
     pub running: Mutex<bool>,
+    // FIX: canal stdin para o processo Node em execução (modo manual)
+    // Option porque só existe enquanto há um processo rodando
+    pub node_stdin: Mutex<Option<std::process::ChildStdin>>,
 }
 
 // ── Commands Tauri ────────────────────────────────────────────────────────────
@@ -138,17 +140,11 @@ async fn stop_night_mode(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn get_jobs(
     limit: Option<i64>,
-    status: Option<Vec<String>>,
+    status: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<JobListing>, String> {
     let db = state.db.lock().unwrap();
     db.get_jobs(limit, status).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    db.clear_history().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -161,12 +157,6 @@ async fn get_night_report(
 }
 
 #[tauri::command]
-async fn save_job(job: JobListing, state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    db.upsert_job(&job).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 async fn get_resume_templates() -> Result<Vec<String>, String> {
     latex::list_templates().map_err(|e| e.to_string())
 }
@@ -174,11 +164,6 @@ async fn get_resume_templates() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn read_resume_template(name: String) -> Result<String, String> {
     latex::read_template(&name).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn load_saved_resume_packages() -> Result<Vec<resume::SavedResumePackage>, String> {
-    resume::load_saved_packages().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -195,7 +180,7 @@ async fn search_jobs(
         max_per_night: 30,
         delay_minutes: 1,
         cover_letter: false,
-        stop_on_captcha: true,
+        stop_on_captcha: false,
         blacklist: vec![],
         sites,
         modality,
@@ -209,26 +194,47 @@ async fn search_jobs(
     Ok(())
 }
 
+// FIX: approve_job agora envia "approve" ao processo Node via stdin
+// em vez de escrever arquivo no disco
 #[tauri::command]
 async fn approve_job(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut queue = state.queue.lock().unwrap();
-    queue.approve(job_id);
+    // Atualiza fila interna
+    {
+        let mut q = state.queue.lock().unwrap();
+        q.approve(job_id.clone());
+    }
+
+    // FIX: envia ao Node via stdin
+    let mut stdin_guard = state.node_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *stdin_guard {
+        queue::send_to_node(stdin, &job_id, "approve");
+    }
+
     Ok(())
 }
 
+// FIX: skip_job também envia sinal ao Node além de atualizar o DB
 #[tauri::command]
 async fn skip_job(
     job_id: String,
     reason: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    db.update_job_status(&job_id, "skipped", Some(&reason), None, None)
-        .map_err(|e| e.to_string())
-}
+    // Atualiza DB
+    {
+        let db = state.db.lock().unwrap();
+        db.update_job_status(&job_id, "skipped", Some(&reason), None, None)
+            .map_err(|e| e.to_string())?;
+    }
 
-// save_resume_package vive em resume.rs e é referenciado diretamente abaixo
-// — sem re-exportar para evitar duplicata no generate_handler!
+    // FIX: envia sinal de skip ao Node (modo manual aguardando resposta)
+    let mut stdin_guard = state.node_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *stdin_guard {
+        queue::send_to_node(stdin, &job_id, "skip");
+    }
+
+    Ok(())
+}
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -246,6 +252,7 @@ pub fn run() {
             db: Mutex::new(db),
             queue: Mutex::new(JobQueue::new()),
             running: Mutex::new(false),
+            node_stdin: Mutex::new(None), // FIX: inicializado vazio
         })
         .invoke_handler(tauri::generate_handler![
             check_ollama,
@@ -259,13 +266,9 @@ pub fn run() {
             get_night_report,
             get_resume_templates,
             read_resume_template,
-            load_saved_resume_packages,
             approve_job,
             skip_job,
-            save_job,
-            clear_history,
             resume::save_resume_package,
-            resume::delete_resume_package,
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao iniciar aplicação");
