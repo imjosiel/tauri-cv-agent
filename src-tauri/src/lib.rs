@@ -259,7 +259,22 @@ pub fn run() {
             resume::save_resume_package,
             resume::load_saved_resume_packages,
             resume::delete_resume_package,
+            save_job,
+            clear_history,
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao iniciar aplicação");
+}
+
+// Esses dois commands são chamados pelo frontend (App.tsx) para persistir
+// eventos do modo noturno no banco e limpar o histórico.
+
+#[tauri::command]
+async fn save_job(job: JobListing, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().unwrap().upsert_job(&job).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().unwrap().clear_history().map_err(|e| e.to_string())
 }
