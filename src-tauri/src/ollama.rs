@@ -144,39 +144,32 @@ Responda agora seguindo exatamente o formato acima."#,
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Escapa caracteres especiais LaTeX que LLMs frequentemente inserem
-/// em texto livre sem escape (#, &).
-/// Não toca em sequências já escapadas (\#, \&) nem em linhas de tabular
-/// (onde & é separador de coluna — detectado pela presença de múltiplos &).
+/// Escapa # e & inseridos pelo LLM em texto livre, sem tocar em comandos LaTeX.
+/// '&' é preservado em linhas tabulares (mais de um '&' não escapado na linha).
 fn sanitize_latex(tex: &str) -> String {
-    let mut result = String::with_capacity(tex.len() + 32);
+    let mut result = String::with_capacity(tex.len() + 64);
     for line in tex.split('\n') {
-        // Conta & não escapados na linha — se > 1, é linha de tabular, não mexe
-        let raw_amps = line.chars()
-            .zip(std::iter::once(' ').chain(line.chars()))
-            .filter(|&(c, prev)| c == '&' && prev != '\\')
+        // Detecta linha tabular: conta & não precedidos de \
+        let raw_amps = line
+            .char_indices()
+            .filter(|&(i, c)| {
+                c == '&' && !line[..i].ends_with('\\')
+            })
             .count();
-        let is_tabular_line = raw_amps > 1;
+        let is_tabular = raw_amps > 1;
 
-        let mut out = String::with_capacity(line.len() + 4);
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    // Comando LaTeX — copia a barra e o próximo char sem modificar
-                    out.push('\\');
-                    if let Some(next) = chars.next() { out.push(next); }
-                }
-                '#' => { out.push_str("\\#"); }
-                '&' if !is_tabular_line => { out.push_str("\\&"); }
-                other => { out.push(other); }
+        let mut prev = ' ';
+        for ch in line.chars() {
+            match ch {
+                '#' if prev != '\\' => result.push_str("\\#"),
+                '&' if prev != '\\' && !is_tabular => result.push_str("\\&"),
+                other => result.push(other),
             }
+            prev = ch;
         }
-        result.push_str(&out);
         result.push('\n');
     }
-    // Remove o \n extra do final se o original não tinha
-    if !tex.ends_with('\n') && result.ends_with('\n') {
+    if !tex.ends_with('\n') {
         result.pop();
     }
     result
