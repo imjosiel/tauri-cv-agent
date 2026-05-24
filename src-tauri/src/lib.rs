@@ -270,7 +270,30 @@ pub fn run() {
 // eventos do modo noturno no banco e limpar o histórico.
 
 #[tauri::command]
-async fn save_job(job: JobListing, state: State<'_, AppState>) -> Result<(), String> {
+async fn save_job(raw: serde_json::Value, state: State<'_, AppState>) -> Result<(), String> {
+    // Aceita Value em vez de JobListing para ser tolerante a campos extras ou
+    // tipos ligeiramente diferentes vindos do frontend (ex: score como float).
+    let job = JobListing {
+        id:              raw["id"].as_str().unwrap_or("").to_string(),
+        title:           raw["title"].as_str().unwrap_or("").to_string(),
+        company:         raw["company"].as_str().unwrap_or("").to_string(),
+        url:             raw["url"].as_str().unwrap_or("").to_string(),
+        site:            raw["site"].as_str().unwrap_or("").to_string(),
+        description:     raw["description"].as_str().unwrap_or("").to_string(),
+        score:           raw["score"].as_f64().map(|v| v as u8),
+        status:          raw["status"].as_str().unwrap_or("found").to_string(),
+        applied_at:      raw["applied_at"].as_str().map(String::from),
+        resume_path:     raw["resume_path"].as_str().map(String::from),
+        skip_reason:     raw["skip_reason"].as_str().map(String::from),
+        screenshot_path: raw["screenshot_path"].as_str().map(String::from),
+    };
+
+    if job.id.is_empty() {
+        log::warn!("save_job: id vazio, ignorando. payload: {:?}", raw);
+        return Ok(());
+    }
+
+    log::info!("save_job: {} — {} ({})", job.status, job.title, job.id);
     state.db.lock().unwrap().upsert_job(&job).map_err(|e| e.to_string())
 }
 
@@ -278,3 +301,4 @@ async fn save_job(job: JobListing, state: State<'_, AppState>) -> Result<(), Str
 async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     state.db.lock().unwrap().clear_history().map_err(|e| e.to_string())
 }
+
