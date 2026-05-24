@@ -84,98 +84,103 @@ function loadPlaceholderSet() {
   return placeholders;
 }
 
-function parseIncludeGraphics(s) {
-  // s começa em \includegraphics
-  let idx = "\\includegraphics".length;
-  if (idx >= s.length) return null;
+// Encontra o último argumento {conteudo} de um comando LaTeX.
+// Retorna { open, close, content } onde open/close são índices do { e }.
+function lastBraceArg(s, cmd) {
+  const cmdPos = s.indexOf(cmd);
+  if (cmdPos === -1) return null;
+  let i = cmdPos + cmd.length;
+  let last = null;
 
-  // Pula espaços
-  while (idx < s.length && /\s/.test(s[idx])) idx++;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t") { i++; continue; }
+    if (ch === "[") {
+      i++;
+      let d = 1;
+      while (i < s.length && d > 0) {
+        if (s[i] === "[") d++;
+        else if (s[i] === "]") d--;
+        i++;
+      }
+      continue;
+    }
+    if (ch === "{") {
+      const open = i;
+      i++;
+      let d = 1;
+      while (i < s.length && d > 0) {
+        if (s[i] === "{") d++;
+        else if (s[i] === "}") d--;
+        i++;
+      }
+      last = { open, close: i - 1 };
+      continue;
+    }
+    break;
+  }
 
-  // Pula [opções] se presente
-  if (s[idx] === "[") {
-    idx++;
-    let depth = 1;
-    while (idx < s.length && depth > 0) {
-      if (s[idx] === "[") depth++;
-      else if (s[idx] === "]") depth--;
-      idx++;
+  if (!last) return null;
+  const content = s.slice(last.open + 1, last.close).trim();
+  return { open: last.open, close: last.close, content };
+}
+
+function patchLine(line, valid) {
+  let s = line;
+
+  // \includegraphics
+  if (s.includes("\\includegraphics")) {
+    const r = lastBraceArg(s, "\\includegraphics");
+    if (r && !valid(r.content)) {
+      const cmdStart = s.indexOf("\\includegraphics");
+      const cmdEnd   = r.close + 1;
+      const inner    = s.slice(cmdStart, cmdEnd);
+      s = s.slice(0, cmdStart) + `\\phantom{${inner}}` + s.slice(cmdEnd);
     }
   }
 
-  // Pula espaços
-  while (idx < s.length && /\s/.test(s[idx])) idx++;
-
-  // Extrai {filename}
-  if (s[idx] !== "{") return null;
-  idx++;
-  const nameStart = idx;
-  let depth = 1;
-  while (idx < s.length && depth > 0) {
-    if (s[idx] === "{") depth++;
-    else if (s[idx] === "}") depth--;
-    idx++;
+  // \roundpic
+  if (s.includes("\\roundpic")) {
+    const r = lastBraceArg(s, "\\roundpic");
+    if (r && !valid(r.content)) {
+      s = s.slice(0, r.open) + "{}" + s.slice(r.close + 1);
+    }
   }
-  if (depth !== 0) return null;
 
-  const filename = s.slice(nameStart, idx - 1).trim();
-  if (!filename) return null;
+  // \cvevent, \cvdegree, etc — último {} é a imagem
+  for (const cmd of ["\\cvevent", "\\cvdegree", "\\cvpub", "\\cvproject"]) {
+    if (!s.includes(cmd)) continue;
+    const r = lastBraceArg(s, cmd);
+    if (r && r.content && !valid(r.content)) {
+      console.log(`[latex] patch ${cmd} image: '${r.content}'`);
+      s = s.slice(0, r.open) + "{}" + s.slice(r.close + 1);
+    }
+    break;
+  }
 
-  return { fullMatch: s.slice(0, idx), filename };
+  return s;
 }
 
 function patchMissingImages(tex, jobDir) {
+
   const placeholders = loadPlaceholderSet();
-  let result = "";
-  let remaining = tex;
-  const marker = "\\includegraphics";
 
-  while (true) {
-    const pos = remaining.indexOf(marker);
-    if (pos === -1) { result += remaining; break; }
-
-    result += remaining.slice(0, pos);
-    remaining = remaining.slice(pos);
-
-    const parsed = parseIncludeGraphics(remaining);
-    if (!parsed) {
-      // Não conseguiu parsear — avança um caractere para não travar
-      result += marker;
-      remaining = remaining.slice(marker.length);
-      continue;
-    }
-
-    const { fullMatch, filename } = parsed;
-
-    // Verifica se o arquivo existe (com ou sem extensão explícita)
-    const fileExists = (() => {
-      const candidates = [
-        join(jobDir, filename),
-        join(jobDir, filename + ".png"),
-        join(jobDir, filename + ".jpg"),
-        join(jobDir, filename + ".pdf"),
-      ];
-      return candidates.some((p) => {
-        try {
-          const { size } = require("fs").statSync(p);
-          return size > 100; // arquivo válido tem pelo menos 100 bytes
-        } catch { return false; }
-      });
-    })();
-
-    const isPlaceholder = placeholders.has(filename);
-
-    if (!fileExists || isPlaceholder) {
-      console.log(`[latex] phantom: '${filename}' (exists=${fileExists}, placeholder=${isPlaceholder})`);
-      result += `\\phantom{${fullMatch}}`;
-    } else {
-      result += fullMatch;
-    }
-
-    remaining = remaining.slice(fullMatch.length);
+  function valid(filename) {
+    if (!filename) return true;
+    if (placeholders.has(filename)) return false;
+    const candidates = [
+      join(jobDir, filename),
+      join(jobDir, filename + ".png"),
+      join(jobDir, filename + ".jpg"),
+      join(jobDir, filename + ".pdf"),
+    ];
+    return candidates.some((p) => {
+      try { return require("fs").statSync(p).size > 100; } catch { return false; }
+    });
   }
 
-  return result;
+  const lines = tex.split("\n");
+  return lines.map((line) => patchLine(line, valid)).join("\n");
 }
 
 // ── Compilação ────────────────────────────────────────────────────────────────
