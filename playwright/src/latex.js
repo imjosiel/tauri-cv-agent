@@ -148,11 +148,20 @@ function patchMissingImages(tex, jobDir) {
     const { fullMatch, filename } = parsed;
 
     // Verifica se o arquivo existe (com ou sem extensão explícita)
-    const fileExists =
-      existsSync(join(jobDir, filename)) ||
-      existsSync(join(jobDir, filename + ".png")) ||
-      existsSync(join(jobDir, filename + ".jpg")) ||
-      existsSync(join(jobDir, filename + ".pdf"));
+    const fileExists = (() => {
+      const candidates = [
+        join(jobDir, filename),
+        join(jobDir, filename + ".png"),
+        join(jobDir, filename + ".jpg"),
+        join(jobDir, filename + ".pdf"),
+      ];
+      return candidates.some((p) => {
+        try {
+          const { size } = require("fs").statSync(p);
+          return size > 100; // arquivo válido tem pelo menos 100 bytes
+        } catch { return false; }
+      });
+    })();
 
     const isPlaceholder = placeholders.has(filename);
 
@@ -239,9 +248,15 @@ function copyAssetsToOutput(jobDir) {
   if (!existsSync(TPL_DIR)) return;
 
   const supported = new Set([".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty", ".ttf", ".otf"]);
+  const placeholders = loadPlaceholderSet();
   let count = 0;
 
   function tryCopy(src, name) {
+    // Não copia placeholders — deixa o arquivo ausente para patchMissingImages agir
+    if (placeholders.has(name)) {
+      console.log(`[latex] Pulando placeholder: ${name}`);
+      return;
+    }
     try { copyFileSync(src, join(jobDir, name)); count++; }
     catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
   }
