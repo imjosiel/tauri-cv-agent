@@ -138,11 +138,49 @@ Responda agora seguindo exatamente o formato acima."#,
     let mut meta: Value = serde_json::from_str(&meta_json)
         .unwrap_or_else(|_| json!({"changes": [], "cover_letter": ""}));
 
-    meta["edited_tex"] = Value::String(edited_tex);
+    meta["edited_tex"] = Value::String(sanitize_latex(&edited_tex));
     Ok(meta)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Escapa caracteres especiais LaTeX que LLMs frequentemente inserem
+/// em texto livre sem escape (#, &).
+/// Não toca em sequências já escapadas (\#, \&) nem em linhas de tabular
+/// (onde & é separador de coluna — detectado pela presença de múltiplos &).
+fn sanitize_latex(tex: &str) -> String {
+    let mut result = String::with_capacity(tex.len() + 32);
+    for line in tex.split('\n') {
+        // Conta & não escapados na linha — se > 1, é linha de tabular, não mexe
+        let raw_amps = line.chars()
+            .zip(std::iter::once(' ').chain(line.chars()))
+            .filter(|&(c, prev)| c == '&' && prev != '\\')
+            .count();
+        let is_tabular_line = raw_amps > 1;
+
+        let mut out = String::with_capacity(line.len() + 4);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    // Comando LaTeX — copia a barra e o próximo char sem modificar
+                    out.push('\\');
+                    if let Some(next) = chars.next() { out.push(next); }
+                }
+                '#' => { out.push_str("\\#"); }
+                '&' if !is_tabular_line => { out.push_str("\\&"); }
+                other => { out.push(other); }
+            }
+        }
+        result.push_str(&out);
+        result.push('\n');
+    }
+    // Remove o \n extra do final se o original não tinha
+    if !tex.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
 
 fn strip_markdown_fences(s: &str) -> String {
     let s = s.trim();
