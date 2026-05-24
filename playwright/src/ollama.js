@@ -182,26 +182,37 @@ Responda agora seguindo exatamente o formato acima.`;
 }
 
 // Escapa caracteres especiais LaTeX que o LLM insere em texto livre.
-// Opera apenas fora de comandos LaTeX (sequências iniciadas por \).
-// Trata: # & % (os mais comuns inseridos pelo LLM sem escape)
-// Não toca em: \# \& \% já escapados, nem em argumentos de comandos LaTeX.
+// Percorre char a char: se o char anterior for '\', já está escapado — não toca.
+// Para '&': se a linha tiver mais de um '&' não escapado, é tabular — não toca.
 function sanitizeLatex(tex) {
-  // Percorre caractere a caractere rastreando se estamos dentro de um
-  // argumento de comando LaTeX ({...} após \comando) ou em texto livre.
-  // Estratégia simples e segura: só escapa o char se o char imediatamente
-  // anterior não for uma barra invertida.
-  return tex
-    // Escapa # não precedido de \ (ex: "C#" → "C\#", mas "\#" fica intacto)
-    .replace(/(?<!\)#/g, "\#")
-    // Escapa & não precedido de \ e não dentro de tabular/align
-    // (heurística: & precedido de espaço ou texto, não de { ou \ ou ^)
-    .replace(/(?<!\)&(?!\s*\)/g, (m, offset, str) => {
-      // Mantém & em ambientes de tabela: se a linha tem múltiplos &, é tabular
-      const line = str.slice(str.lastIndexOf("\n", offset) + 1,
-                             str.indexOf("\n", offset) >>> 0 || str.length);
-      const ampCount = (line.match(/(?<!\)&/g) || []).length;
-      return ampCount > 1 ? m : "\&";
-    });
+  const lines = tex.split("\n");
+  const out = [];
+
+  for (const line of lines) {
+    // Conta & não escapados na linha para detectar ambiente tabular
+    let rawAmps = 0;
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === "&" && (i === 0 || line[i - 1] !== "\\")) rawAmps++;
+    }
+    const isTabularLine = rawAmps > 1;
+
+    let result = "";
+    for (let i = 0; i < line.length; i++) {
+      const ch   = line[i];
+      const prev = i > 0 ? line[i - 1] : "";
+
+      if (ch === "#" && prev !== "\\") {
+        result += "\\#";
+      } else if (ch === "&" && prev !== "\\" && !isTabularLine) {
+        result += "\\&";
+      } else {
+        result += ch;
+      }
+    }
+    out.push(result);
+  }
+
+  return out.join("\n");
 }
 
 function buildResult(raw, editedTex) {
