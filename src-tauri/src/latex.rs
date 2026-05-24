@@ -62,8 +62,13 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     let tex_path = out_dir.join("curriculo.tex");
     let pdf_path = out_dir.join("curriculo.pdf");
 
-    std::fs::write(&tex_path, tex_content)?;
+    // Copia assets antes de patchear — assim sabemos o que realmente chegou no disco
     copy_assets_to_output(&out_dir)?;
+
+    // Substitui imagens faltantes (placeholder ou simplesmente ausentes) por
+    // \phantom{\includegraphics{...}} para que o pdflatex não quebre
+    let patched = patch_missing_images(tex_content, &out_dir);
+    std::fs::write(&tex_path, &patched)?;
 
     // latexmk é preferível (resolve referências cruzadas automaticamente);
     // fallback para pdflatex com duas passagens manuais.
@@ -170,4 +175,118 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
 
     log::info!("{} assets copiados para {:?}", copied, out_dir);
     Ok(())
+}
+
+
+/// Substitui \includegraphics{arquivo} por \phantom{\includegraphics{arquivo}}
+/// para todo arquivo que não existe no diretório de saída.
+/// Isso preserva o espaço reservado para a imagem sem quebrar a compilação.
+fn patch_missing_images(tex: &str, out_dir: &PathBuf) -> String {
+    // Lê quais arquivos foram explicitamente marcados como placeholder no assets-meta.json
+    // (qualquer template na pasta de templates)
+    let placeholder_set = load_placeholder_set();
+
+    let mut result = String::with_capacity(tex.len());
+    let mut remaining = tex;
+
+    // Processa cada \includegraphics no tex
+    while let Some(cmd_pos) = remaining.find("\\includegraphics") {
+        // Acumula tudo antes do comando
+        result.push_str(&remaining[..cmd_pos]);
+        remaining = &remaining[cmd_pos..];
+
+        // Tenta extrair o nome do arquivo entre chaves (com possível [opções] antes)
+        if let Some((full_match, filename)) = parse_includegraphics(remaining) {
+            let file_exists = out_dir.join(&filename).exists()
+                || out_dir.join(format!("{}.png", filename)).exists()
+                || out_dir.join(format!("{}.jpg", filename)).exists()
+                || out_dir.join(format!("{}.pdf", filename)).exists();
+
+            let is_placeholder = placeholder_set.contains(&filename);
+
+            if !file_exists || is_placeholder {
+                log::info!("patch_missing_images: wrapping '{}' in \\phantom{{}}", filename);
+                result.push_str(&format!("\\phantom{{{}}}", full_match));
+            } else {
+                result.push_str(full_match);
+            }
+
+            remaining = &remaining[full_match.len()..];
+        } else {
+            // Não conseguiu parsear — copia o comando inteiro e avança
+            result.push_str("\\includegraphics");
+            remaining = &remaining["\\includegraphics".len()..];
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Parseia \includegraphics[opções]{arquivo} e retorna (match_completo, filename).
+fn parse_includegraphics(s: &str) -> Option<(&str, String)> {
+    let mut idx = "\\includegraphics".len();
+    if idx >= s.len() { return None; }
+
+    // Pula espaços
+    while idx < s.len() && s.as_bytes()[idx].is_ascii_whitespace() { idx += 1; }
+
+    // Pula [opções] se presente
+    if s.as_bytes().get(idx) == Some(&b'[') {
+        idx += 1;
+        let mut depth = 1usize;
+        while idx < s.len() && depth > 0 {
+            match s.as_bytes()[idx] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+
+    // Pula espaços
+    while idx < s.len() && s.as_bytes()[idx].is_ascii_whitespace() { idx += 1; }
+
+    // Extrai {filename}
+    if s.as_bytes().get(idx) != Some(&b'{') { return None; }
+    idx += 1;
+    let name_start = idx;
+    let mut depth = 1usize;
+    while idx < s.len() && depth > 0 {
+        match s.as_bytes()[idx] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        idx += 1;
+    }
+    if depth != 0 { return None; }
+
+    let filename = s[name_start..idx - 1].trim().to_string();
+    if filename.is_empty() { return None; }
+
+    Some((&s[..idx], filename))
+}
+
+/// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
+fn load_placeholder_set() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let tpl_dir = templates_dir();
+    if !tpl_dir.exists() { return set; }
+
+    for entry in std::fs::read_dir(&tpl_dir).into_iter().flatten().flatten() {
+        let meta_path = entry.path().join("assets-meta.json");
+        if let Ok(content) = std::fs::read_to_string(&meta_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                for item in v["placeholder_assets"].as_array().unwrap_or(&vec![]) {
+                    if let Some(s) = item.as_str() {
+                        set.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    set
 }
