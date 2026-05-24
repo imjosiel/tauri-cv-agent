@@ -125,6 +125,44 @@ function lastBraceArg(s, cmd) {
   return { open: last.open, close: last.close, content };
 }
 
+// Injeta redefinições LaTeX de \cvevent, \cvdegree e \roundpic que usam
+// \ifthenelse para ignorar o argumento de imagem quando estiver vazio.
+function injectSafeCommands(tex) {
+  if (tex.includes("% cv-agent: safe image commands")) return tex;
+
+  const safeDefs = `
+% cv-agent: safe image commands — redefine para ignorar imagem ausente
+\\makeatletter
+\\renewcommand{\\cvevent}[6]{%
+  {#1} & \\textbf{#2}\\newline\\textsc{#3} $\\cdot$ {#4 ~\\faMapMarker}\\newline%
+  {\\color{black!70}\\footnotesize #5}\\vspace{1.5em} &
+  \\raisebox{-0.7\\height}{%
+    \\ifthenelse{\\equal{#6}{}}{}{\\includegraphics[height=1cm]{#6}}%
+  }%
+}
+\\renewcommand{\\cvdegree}[6]{%
+  {#1} & \\textbf{#2}\\newline\\textsc{#3} $\\cdot$ {#4 {\\phantom{i}\\footnotesize ~\\faUniversity}}\\newline%
+  {\\color{black!70}\\scriptsize #5}\\vspace{0.5em} &
+  \\raisebox{-0.7\\height}{%
+    \\ifthenelse{\\equal{#6}{}}{}{\\includegraphics[height=0.5cm]{#6}}%
+  }%
+}
+\\renewcommand{\\roundpic}[1]{%
+  \\ifthenelse{\\equal{#1}{}}{}{%
+    \\begin{figure}[H]\\tikz\\draw[path picture={\\node at (path picture bounding box.center)%
+      {\\includegraphics[height=3.5cm]{#1}};}] (0,2) circle (1.7);\\end{figure}}%
+}
+\\makeatother
+`;
+
+  const pos = tex.indexOf("\\begin{document}");
+  if (pos !== -1) {
+    return tex.slice(0, pos) + safeDefs + tex.slice(pos);
+  }
+  return tex + safeDefs;
+}
+
+
 function patchLine(line, valid) {
   let s = line;
 
@@ -195,8 +233,11 @@ export async function compileLaTeX(texContent, jobId) {
   // 1. Copia assets primeiro — assim patchMissingImages sabe o que existe
   copyAssetsToOutput(jobDir);
 
-  // 2. Aplica patch de imagens faltantes antes de escrever o .tex
-  const patched = patchMissingImages(texContent, jobDir);
+  // 2. Injeta redefinições seguras de \cvevent, \cvdegree, \roundpic
+  const withSafeCmds = injectSafeCommands(texContent);
+
+  // 3. Substitui imagens faltantes por argumento vazio (tratado pelas redefinições)
+  const patched = patchMissingImages(withSafeCmds, jobDir);
   writeFileSync(texPath, patched, "utf8");
 
   const env  = buildEnv();
