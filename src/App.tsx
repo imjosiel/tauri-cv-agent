@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "./store/appStore";
@@ -26,32 +26,33 @@ export default function App() {
   } = useAppStore();
 
   const [texInstall, setTexInstall] = useState<{
-    active: boolean;
-    pct: number;
-    message: string;
+    active: boolean; pct: number; message: string;
   }>({ active: false, pct: 0, message: "" });
+
+  // Ref para garantir que os listeners só são registrados uma vez,
+  // mesmo em StrictMode (que monta/desmonta componentes duas vezes em dev).
+  const listenersRegistered = useRef(false);
 
   useEffect(() => {
     invoke<any>("check_ollama").then(setOllama).catch(console.error);
 
-    // Carrega currículos do disco uma única vez — ficam no store global
-    // e sobrevivem à navegação entre abas
+    // Carrega currículos do disco uma única vez
     if (!resumesLoaded) {
       invoke<ResumePackage[]>("load_saved_resume_packages")
-        .then((pkgs) => {
-          setResumePackages(pkgs ?? []);
-          setResumesLoaded(true);
-        })
+        .then((pkgs) => { setResumePackages(pkgs ?? []); setResumesLoaded(true); })
         .catch(() => setResumesLoaded(true));
     }
 
+    // Evita registro duplo de listeners (React StrictMode monta duas vezes em dev)
+    if (listenersRegistered.current) return;
+    listenersRegistered.current = true;
+
     const unlisten: Array<() => void> = [];
-    const on = async (event: string, handler: (p: any) => void) => {
-      const off = await listen(event, (e) => handler(e.payload));
-      unlisten.push(off);
+    const on = (event: string, handler: (p: any) => void) => {
+      listen(event, (e) => handler(e.payload)).then((off) => unlisten.push(off));
     };
 
-    // Instalação do TinyTeX
+    // ── TinyTeX ──────────────────────────────────────────────────────────────
     on("texlive_progress", (p: { pct: number; message: string }) => {
       if (p.pct >= 100) {
         setTexInstall({ active: true, pct: 100, message: p.message });
@@ -61,20 +62,40 @@ export default function App() {
       }
     });
 
-    // Eventos do modo noturno
+    // ── Modo noturno ─────────────────────────────────────────────────────────
     on("night_started",  () => setRunning(true));
     on("night_finished", (p) => { setRunning(false); addEvent("finished", p); });
     on("night_error",    (p) => { setRunning(false); addEvent("error", p); });
-    on("job_found",      (p) => { addEvent("found",    p); saveJob(p, "found"); });
-    on("job_analyzed",   (p) => { addEvent("analyzed", p); saveJob(p, "analyzed", { score: p.score ?? null }); });
-    on("job_applied",    (p) => { addEvent("applied",  p); saveJob(p, "applied",  { score: p.score ?? null, applied_at: p.applied_at ?? new Date().toISOString(), resume_path: p.resume_path ?? null }); });
-    on("job_skipped",    (p) => { addEvent("skipped",  p); saveJob(p, "skipped",  { score: p.score ?? null, skip_reason: p.skip_reason ?? p.reason ?? null }); });
-    on("captcha_detected",    (p) => addEvent("captcha",  p));
-    on("night_progress",      (p) => addEvent("progress", p));
+
+    on("job_found", (p) => {
+      addEvent("found", p);
+      saveJob({ ...p, status: "found" });
+    });
+
+    on("job_analyzed", (p) => {
+      addEvent("analyzed", p);
+      saveJob({ ...p, status: "analyzed" });
+    });
+
+    on("job_applied", (p) => {
+      addEvent("applied", p);
+      saveJob({ ...p, status: "applied" });
+    });
+
+    on("job_skipped", (p) => {
+      addEvent("skipped", p);
+      saveJob({ ...p, status: "skipped" });
+    });
+
+    on("captcha_detected",     (p) => { addEvent("captcha",  p); saveJob({ ...p, status: "captcha" }); });
+    on("night_progress",       (p) => addEvent("progress", p));
     on("job_awaiting_approval",(p) => addEvent("approval", p));
 
-    return () => unlisten.forEach((f) => f());
-  }, []);
+    return () => {
+      unlisten.forEach((f) => f());
+      listenersRegistered.current = false;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className={styles.shell}>
@@ -137,15 +158,26 @@ export default function App() {
   );
 }
 
-function saveJob(p: any, status: string, extra: Record<string, any> = {}) {
-  invoke("save_job", {
-    job: {
-      id: p.id, title: p.title ?? "", company: p.company ?? "",
-      url: p.url ?? "", site: p.site ?? "", description: p.description ?? "",
-      score: null, status, applied_at: null, resume_path: null,
-      skip_reason: null, screenshot_path: null, ...extra,
-    },
-  }).catch(console.error);
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function saveJob(p: any) {
+  // Garante que todos os campos obrigatórios estejam presentes
+  // antes de enviar ao backend — evita erros de deserialização no Rust.
+  const job = {
+    id:              p.id              ?? crypto.randomUUID(),
+    title:           p.title           ?? p.job_title ?? "",
+    company:         p.company         ?? "",
+    url:             p.url             ?? p.link      ?? "",
+    site:            p.site            ?? "",
+    description:     p.description     ?? "",
+    score:           p.score           ?? null,
+    status:          p.status          ?? "found",
+    applied_at:      p.applied_at      ?? null,
+    resume_path:     p.resume_path     ?? null,
+    skip_reason:     p.skip_reason     ?? p.reason ?? null,
+    screenshot_path: p.screenshot_path ?? null,
+  };
+  invoke("save_job", { job }).catch(console.error);
 }
 
 function OllamaIndicator() {
