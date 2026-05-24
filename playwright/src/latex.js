@@ -1,19 +1,14 @@
 // playwright/src/latex.js
-//
-// Compila um .tex em PDF usando o TeX Live disponível no sistema.
-// Prioridade:
-//   1. TinyTeX instalado pelo cv-agent (%APPDATA%/cv-agent/tinytex)
-//   2. TeX Live do sistema (C:\texlive\*, /usr/local/texlive/*)
-//   3. pdflatex no PATH
-
-import { mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync } from "fs";
+import { mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync, readFileSync } from "fs";
 import { join, extname, delimiter } from "path";
 import { execSync } from "child_process";
 
-const DATA_DIR = join(process.env.APPDATA ?? process.env.HOME ?? ".", "cv-agent");
-const OUT_DIR  = join(DATA_DIR, "curriculo", "output");
+const DATA_DIR    = join(process.env.APPDATA ?? process.env.HOME ?? ".", "cv-agent");
+const OUT_DIR     = join(DATA_DIR, "curriculo", "output");
+const TPL_DIR     = join(DATA_DIR, "curriculo", "templates");
 
-// Diretórios de binários TinyTeX conhecidos (mesmo mapeamento do texlive.rs)
+// ── Detecção do TinyTeX ───────────────────────────────────────────────────────
+
 function findTexBin() {
   const candidates = [];
 
@@ -25,7 +20,6 @@ function findTexBin() {
       join(tinytex, "TinyTeX", "bin", "windows"),
       join(tinytex, "TinyTeX", "bin", "win32"),
     );
-    // TeX Live do sistema — testa anos de 2030 até 2020
     for (let y = 2030; y >= 2020; y--) {
       candidates.push(
         join("C:", "texlive", String(y), "bin", "windows"),
@@ -51,8 +45,8 @@ function findTexBin() {
     candidates.push("/usr/bin", "/usr/local/bin");
   }
 
-  const pdflatexExe = process.platform === "win32" ? "pdflatex.exe" : "pdflatex";
-  return candidates.find((bin) => existsSync(join(bin, pdflatexExe))) ?? null;
+  const exe = process.platform === "win32" ? "pdflatex.exe" : "pdflatex";
+  return candidates.find((bin) => existsSync(join(bin, exe))) ?? null;
 }
 
 function buildEnv() {
@@ -62,10 +56,120 @@ function buildEnv() {
     env.PATH = `${texBin}${delimiter}${env.PATH ?? ""}`;
     console.log(`[latex] Usando TeX de: ${texBin}`);
   } else {
-    console.warn("[latex] TeX Live não encontrado no PATH nem nos diretórios conhecidos.");
+    console.warn("[latex] TeX Live não encontrado.");
   }
   return env;
 }
+
+// ── Patch de imagens faltantes ────────────────────────────────────────────────
+// Espelha a função patch_missing_images do latex.rs.
+// Substitui \includegraphics{arquivo} por \phantom{\includegraphics{arquivo}}
+// quando o arquivo não existe no diretório de saída ou está marcado como placeholder.
+
+function loadPlaceholderSet() {
+  const placeholders = new Set();
+  if (!existsSync(TPL_DIR)) return placeholders;
+
+  for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const metaPath = join(TPL_DIR, entry.name, "assets-meta.json");
+    if (!existsSync(metaPath)) continue;
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+      for (const f of meta.placeholder_assets ?? []) {
+        placeholders.add(f);
+      }
+    } catch {}
+  }
+  return placeholders;
+}
+
+function parseIncludeGraphics(s) {
+  // s começa em \includegraphics
+  let idx = "\\includegraphics".length;
+  if (idx >= s.length) return null;
+
+  // Pula espaços
+  while (idx < s.length && /\s/.test(s[idx])) idx++;
+
+  // Pula [opções] se presente
+  if (s[idx] === "[") {
+    idx++;
+    let depth = 1;
+    while (idx < s.length && depth > 0) {
+      if (s[idx] === "[") depth++;
+      else if (s[idx] === "]") depth--;
+      idx++;
+    }
+  }
+
+  // Pula espaços
+  while (idx < s.length && /\s/.test(s[idx])) idx++;
+
+  // Extrai {filename}
+  if (s[idx] !== "{") return null;
+  idx++;
+  const nameStart = idx;
+  let depth = 1;
+  while (idx < s.length && depth > 0) {
+    if (s[idx] === "{") depth++;
+    else if (s[idx] === "}") depth--;
+    idx++;
+  }
+  if (depth !== 0) return null;
+
+  const filename = s.slice(nameStart, idx - 1).trim();
+  if (!filename) return null;
+
+  return { fullMatch: s.slice(0, idx), filename };
+}
+
+function patchMissingImages(tex, jobDir) {
+  const placeholders = loadPlaceholderSet();
+  let result = "";
+  let remaining = tex;
+  const marker = "\\includegraphics";
+
+  while (true) {
+    const pos = remaining.indexOf(marker);
+    if (pos === -1) { result += remaining; break; }
+
+    result += remaining.slice(0, pos);
+    remaining = remaining.slice(pos);
+
+    const parsed = parseIncludeGraphics(remaining);
+    if (!parsed) {
+      // Não conseguiu parsear — avança um caractere para não travar
+      result += marker;
+      remaining = remaining.slice(marker.length);
+      continue;
+    }
+
+    const { fullMatch, filename } = parsed;
+
+    // Verifica se o arquivo existe (com ou sem extensão explícita)
+    const fileExists =
+      existsSync(join(jobDir, filename)) ||
+      existsSync(join(jobDir, filename + ".png")) ||
+      existsSync(join(jobDir, filename + ".jpg")) ||
+      existsSync(join(jobDir, filename + ".pdf"));
+
+    const isPlaceholder = placeholders.has(filename);
+
+    if (!fileExists || isPlaceholder) {
+      console.log(`[latex] phantom: '${filename}' (exists=${fileExists}, placeholder=${isPlaceholder})`);
+      result += `\\phantom{${fullMatch}}`;
+    } else {
+      result += fullMatch;
+    }
+
+    remaining = remaining.slice(fullMatch.length);
+  }
+
+  return result;
+}
+
+// ── Compilação ────────────────────────────────────────────────────────────────
 
 export async function compileLaTeX(texContent, jobId) {
   const jobDir = join(OUT_DIR, jobId);
@@ -74,13 +178,17 @@ export async function compileLaTeX(texContent, jobId) {
   const texPath = join(jobDir, "curriculo.tex");
   const pdfPath = join(jobDir, "curriculo.pdf");
 
-  writeFileSync(texPath, texContent, "utf8");
+  // 1. Copia assets primeiro — assim patchMissingImages sabe o que existe
   copyAssetsToOutput(jobDir);
 
-  const env = buildEnv();
+  // 2. Aplica patch de imagens faltantes antes de escrever o .tex
+  const patched = patchMissingImages(texContent, jobDir);
+  writeFileSync(texPath, patched, "utf8");
+
+  const env  = buildEnv();
   const opts = { timeout: 120_000, stdio: "pipe", env };
 
-  // Tenta latexmk (melhor para múltiplas passagens automáticas)
+  // 3. Tenta latexmk, fallback para pdflatex
   let compiled = false;
   try {
     execSync(
@@ -89,11 +197,10 @@ export async function compileLaTeX(texContent, jobId) {
     );
     compiled = true;
   } catch {
-    // latexmk não disponível ou falhou — tenta pdflatex direto
+    // latexmk não disponível ou falhou
   }
 
   if (!compiled) {
-    // Duas passagens para resolver referências cruzadas
     for (let pass = 1; pass <= 2; pass++) {
       try {
         execSync(
@@ -102,14 +209,11 @@ export async function compileLaTeX(texContent, jobId) {
         );
       } catch (err) {
         const raw = (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? "") || String(err);
-
-        // Extrai linhas de erro LaTeX para mensagem limpa
         const errorLines = raw
           .split("\n")
           .filter((l) => l.startsWith("!") || l.includes("Error") || l.includes("Fatal"))
           .slice(0, 6)
           .join("\n");
-
         const summary = errorLines || raw.slice(0, 1000);
 
         if (pass === 1) {
@@ -119,8 +223,7 @@ export async function compileLaTeX(texContent, jobId) {
             `na primeira compilação via interface.`,
           );
         }
-        // Na segunda passagem, alguns erros de referência são esperados — ignora
-        console.warn(`[latex] Aviso na passagem 2 (pode ser inofensivo): ${summary.slice(0, 200)}`);
+        console.warn(`[latex] Aviso na passagem 2: ${summary.slice(0, 200)}`);
       }
     }
   }
@@ -133,31 +236,26 @@ export async function compileLaTeX(texContent, jobId) {
 }
 
 function copyAssetsToOutput(jobDir) {
-  const templatesDir = join(DATA_DIR, "curriculo", "templates");
-  if (!existsSync(templatesDir)) return;
+  if (!existsSync(TPL_DIR)) return;
 
   const supported = new Set([".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty", ".ttf", ".otf"]);
   let count = 0;
 
-  function copyFile(src, name) {
-    try {
-      copyFileSync(src, join(jobDir, name));
-      count++;
-    } catch (e) {
-      console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`);
-    }
+  function tryCopy(src, name) {
+    try { copyFileSync(src, join(jobDir, name)); count++; }
+    catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
   }
 
-  for (const entry of readdirSync(templatesDir, { withFileTypes: true })) {
-    const srcPath = join(templatesDir, entry.name);
+  for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
+    const srcPath = join(TPL_DIR, entry.name);
     if (entry.isDirectory()) {
       for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
         if (asset.isFile() && supported.has(extname(asset.name).toLowerCase())) {
-          copyFile(join(srcPath, asset.name), asset.name);
+          tryCopy(join(srcPath, asset.name), asset.name);
         }
       }
     } else if (entry.isFile() && supported.has(extname(entry.name).toLowerCase())) {
-      copyFile(srcPath, entry.name);
+      tryCopy(srcPath, entry.name);
     }
   }
 
