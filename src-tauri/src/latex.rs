@@ -65,9 +65,12 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     // Copia assets antes de patchear — assim sabemos o que realmente chegou no disco
     copy_assets_to_output(&out_dir)?;
 
-    // Substitui imagens faltantes (placeholder ou simplesmente ausentes) por
-    // \phantom{\includegraphics{...}} para que o pdflatex não quebre
-    let patched = patch_missing_images(tex_content, &out_dir);
+    // 1. Injeta redefinições seguras de \cvevent, \cvdegree, \roundpic
+    //    que verificam se o arquivo existe antes de chamar \includegraphics
+    let with_safe_cmds = inject_safe_commands(tex_content);
+
+    // 2. Substitui imagens faltantes por argumento vazio (já tratado pelas redefinições)
+    let patched = patch_missing_images(&with_safe_cmds, &out_dir);
     std::fs::write(&tex_path, &patched)?;
 
     // latexmk é preferível (resolve referências cruzadas automaticamente);
@@ -185,6 +188,48 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+
+/// Injeta redefinições de \cvevent, \cvdegree e \roundpic que verificam
+/// se o argumento de imagem está vazio antes de chamar \includegraphics.
+/// Isso evita "File '' not found" quando o placeholder está ativo.
+/// Injeta logo antes de \begin{document}.
+fn inject_safe_commands(tex: &str) -> String {
+    // Se já foi injetado (recompilação), não injeta de novo
+    if tex.contains("% cv-agent: safe image commands") {
+        return tex.to_string();
+    }
+
+    let safe_defs = r#"
+% cv-agent: safe image commands — redefine para ignorar imagem ausente
+\makeatletter
+\renewcommand{\cvevent}[6]{%
+  {#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline%
+  {\color{black!70}\footnotesize #5}\vspace{1.5em} &
+  \raisebox{-0.7\height}{%
+    \ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}%
+  }%
+}
+\renewcommand{\cvdegree}[6]{%
+  {#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline%
+  {\color{black!70}\scriptsize #5}\vspace{0.5em} &
+  \raisebox{-0.7\height}{%
+    \ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}%
+  }%
+}
+\renewcommand{\roundpic}[1]{%
+  \ifthenelse{\equal{#1}{}}{}%
+  {\begin{figure}[H]\tikz\draw[path picture={\node at (path picture bounding box.center)%
+    {\includegraphics[height=3.5cm]{#1}};}] (0,2) circle (1.7);\end{figure}}%
+}
+\makeatother
+"#;
+
+    if let Some(pos) = tex.find(r"\begin{document}") {
+        format!("{}{}{}", &tex[..pos], safe_defs, &tex[pos..])
+    } else {
+        format!("{}{}", tex, safe_defs)
+    }
+}
 
 /// Substitui referências a imagens ausentes por \phantom{} ou argumento vazio.
 ///
