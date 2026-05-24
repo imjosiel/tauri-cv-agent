@@ -137,12 +137,15 @@ fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
 
 /// Copia .cls, .sty, imagens e fontes de todos os pacotes salvos
 /// para o diretório de saída, onde o pdflatex vai procurá-los.
+/// Arquivos marcados como placeholder NÃO são copiados — assim o
+/// patchMissingImages os detecta como ausentes e os envolve em \phantom.
 fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
     let tpl_dir = templates_dir();
     if !tpl_dir.exists() {
         return Ok(());
     }
 
+    let placeholder_set = load_placeholder_set();
     let asset_exts = ["png", "jpg", "jpeg", "pdf", "eps", "svg", "cls", "sty", "ttf", "otf"];
     let mut copied = 0usize;
 
@@ -165,6 +168,11 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
             let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("");
             if asset_exts.contains(&ext) {
                 let dest = out_dir.join(ap.file_name().unwrap());
+                let fname = ap.file_name().unwrap().to_string_lossy().to_string();
+                if placeholder_set.contains(&fname) {
+                    log::info!("copy_assets: pulando placeholder '{}'", fname);
+                    continue;
+                }
                 match std::fs::copy(&ap, &dest) {
                     Ok(_) => copied += 1,
                     Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
@@ -197,10 +205,14 @@ fn patch_missing_images(tex: &str, out_dir: &PathBuf) -> String {
 
         // Tenta extrair o nome do arquivo entre chaves (com possível [opções] antes)
         if let Some((full_match, filename)) = parse_includegraphics(remaining) {
-            let file_exists = out_dir.join(&filename).exists()
-                || out_dir.join(format!("{}.png", filename)).exists()
-                || out_dir.join(format!("{}.jpg", filename)).exists()
-                || out_dir.join(format!("{}.pdf", filename)).exists();
+            let file_exists = [
+                out_dir.join(&filename),
+                out_dir.join(format!("{}.png", filename)),
+                out_dir.join(format!("{}.jpg", filename)),
+                out_dir.join(format!("{}.pdf", filename)),
+            ].iter().any(|p| {
+                p.metadata().map(|m| m.len() > 100).unwrap_or(false)
+            });
 
             let is_placeholder = placeholder_set.contains(&filename);
 
