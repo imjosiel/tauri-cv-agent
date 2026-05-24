@@ -186,52 +186,135 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
 }
 
 
-/// Substitui \includegraphics{arquivo} por \phantom{\includegraphics{arquivo}}
-/// para todo arquivo que não existe no diretório de saída.
-/// Isso preserva o espaço reservado para a imagem sem quebrar a compilação.
+/// Substitui referências a imagens ausentes por string vazia ou \phantom.
+///
+/// Padrões tratados:
+///   \includegraphics[opts]{file}          → \phantom{\includegraphics[opts]{file}}
+///   \roundpic{file}                       → \roundpic{}
+///   \cvevent{}{}{}{}{desc}{file}          → \cvevent{}{}{}{}{desc}{}
+///   \cvdegree{}{}{}{}{}{file}             → \cvdegree{}{}{}{}{}{}
+///
+/// Regra: se o arquivo não existe no out_dir (com tamanho > 100 bytes)
+/// ou está marcado como placeholder, a referência é removida.
 fn patch_missing_images(tex: &str, out_dir: &PathBuf) -> String {
-    // Lê quais arquivos foram explicitamente marcados como placeholder no assets-meta.json
-    // (qualquer template na pasta de templates)
     let placeholder_set = load_placeholder_set();
 
-    let mut result = String::with_capacity(tex.len());
-    let mut remaining = tex;
+    // Retorna true se o arquivo existe e é válido no out_dir
+    let valid = |filename: &str| -> bool {
+        if filename.is_empty() { return true; }
+        if placeholder_set.contains(filename) { return false; }
+        [
+            out_dir.join(filename),
+            out_dir.join(format!("{}.png", filename)),
+            out_dir.join(format!("{}.jpg", filename)),
+            out_dir.join(format!("{}.pdf", filename)),
+        ].iter().any(|p| p.metadata().map(|m| m.len() > 100).unwrap_or(false))
+    };
 
-    // Processa cada \includegraphics no tex
-    while let Some(cmd_pos) = remaining.find("\\includegraphics") {
-        // Acumula tudo antes do comando
-        result.push_str(&remaining[..cmd_pos]);
-        remaining = &remaining[cmd_pos..];
+    let mut out = String::with_capacity(tex.len());
 
-        // Tenta extrair o nome do arquivo entre chaves (com possível [opções] antes)
-        if let Some((full_match, filename)) = parse_includegraphics(remaining) {
-            let file_exists = [
-                out_dir.join(&filename),
-                out_dir.join(format!("{}.png", filename)),
-                out_dir.join(format!("{}.jpg", filename)),
-                out_dir.join(format!("{}.pdf", filename)),
-            ].iter().any(|p| {
-                p.metadata().map(|m| m.len() > 100).unwrap_or(false)
-            });
+    for line in tex.split('\n') {
+        let patched = patch_line(line, &valid);
+        out.push_str(&patched);
+        out.push('\n');
+    }
 
-            let is_placeholder = placeholder_set.contains(&filename);
+    if !tex.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
 
-            if !file_exists || is_placeholder {
-                log::info!("patch_missing_images: wrapping '{}' in \\phantom{{}}", filename);
-                result.push_str(&format!("\\phantom{{{}}}", full_match));
-            } else {
-                result.push_str(full_match);
+fn patch_line(line: &str, valid: &dyn Fn(&str) -> bool) -> String {
+    // Extrai o último argumento {X} de um comando LaTeX na linha
+    fn last_brace_content(line: &str, cmd: &str) -> Option<(usize, usize, String)> {
+        let start = line.find(cmd)?;
+        let after_cmd = start + cmd.len();
+        // Percorre todos os grupos {} para chegar no último
+        let mut i = after_cmd;
+        let bytes = line.as_bytes();
+        let mut last_open = None;
+        let mut last_close = None;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => {
+                    last_open = Some(i);
+                    let mut depth = 1usize;
+                    i += 1;
+                    while i < bytes.len() && depth > 0 {
+                        match bytes[i] {
+                            b'{' => depth += 1,
+                            b'}' => { depth -= 1; if depth == 0 { last_close = Some(i); } }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                b'[' => {
+                    // Pula [opções]
+                    let mut depth = 1usize;
+                    i += 1;
+                    while i < bytes.len() && depth > 0 {
+                        match bytes[i] { b'[' => depth += 1, b']' => depth -= 1, _ => {} }
+                        i += 1;
+                    }
+                }
+                b' ' | b'\t' => { i += 1; }
+                _ => break,
             }
-
-            remaining = &remaining[full_match.len()..];
-        } else {
-            // Não conseguiu parsear — copia o comando inteiro e avança
-            result.push_str("\\includegraphics");
-            remaining = &remaining["\\includegraphics".len()..];
+        }
+        match (last_open, last_close) {
+            (Some(o), Some(c)) => {
+                let content = line[o+1..c].trim().to_string();
+                Some((o, c, content))
+            }
+            _ => None,
         }
     }
 
-    result.push_str(remaining);
+    let mut result = line.to_string();
+
+    // ── \includegraphics ─────────────────────────────────────────────────────
+    if let Some(pos) = result.find("\\includegraphics") {
+        if let Some((_, _, filename)) = last_brace_content(&result, "\\includegraphics") {
+            if !valid(&filename) {
+                log::info!("patch: phantom includegraphics '{}'", filename);
+                // Envolve o \includegraphics... inteiro em \phantom{}
+                // Encontra fim do comando (após o último })
+                let after = result[pos..].find('}').map(|i| pos + i + 1).unwrap_or(result.len());
+                let cmd_str = result[pos..after].to_string();
+                result = format!("{}\\phantom{{{}}}{}",
+                    &result[..pos], cmd_str, &result[after..]);
+            }
+        }
+    }
+
+    // ── \roundpic ────────────────────────────────────────────────────────────
+    if let Some((open, close, filename)) = last_brace_content(&result, "\\roundpic") {
+        if !valid(&filename) {
+            log::info!("patch: empty roundpic '{}'", filename);
+            result = format!("{}{}{}",
+                &result[..open+1], &result[close..]);
+            // Torna \roundpic{filename} → \roundpic{}
+            result = result.replacen(&format!("{{{}}}", filename), "{}", 1);
+        }
+    }
+
+    // ── \cvevent e \cvdegree — último {} é a imagem ──────────────────────────
+    for cmd in &["\\cvevent", "\\cvdegree", "\\cvpub", "\\cvproject"] {
+        if !result.contains(cmd) { continue; }
+        if let Some((open, close, filename)) = last_brace_content(&result, cmd) {
+            if !filename.is_empty() && !valid(&filename) {
+                log::info!("patch: empty {} image arg '{}'", cmd, filename);
+                result = format!("{}{}{}",
+                    &result[..open+1],
+                    &result[close..]);
+                // Remove o conteúdo: {filename} → {}
+                result = result.replacen(&format!("{{{}}}", filename), "{}", 1);
+            }
+        }
+    }
+
     result
 }
 
