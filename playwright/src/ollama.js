@@ -181,6 +181,29 @@ Responda agora seguindo exatamente o formato acima.`;
   return buildResult(raw, editedTex);
 }
 
+// Escapa caracteres especiais LaTeX que o LLM insere em texto livre.
+// Opera apenas fora de comandos LaTeX (sequências iniciadas por \).
+// Trata: # & % (os mais comuns inseridos pelo LLM sem escape)
+// Não toca em: \# \& \% já escapados, nem em argumentos de comandos LaTeX.
+function sanitizeLatex(tex) {
+  // Percorre caractere a caractere rastreando se estamos dentro de um
+  // argumento de comando LaTeX ({...} após \comando) ou em texto livre.
+  // Estratégia simples e segura: só escapa o char se o char imediatamente
+  // anterior não for uma barra invertida.
+  return tex
+    // Escapa # não precedido de \ (ex: "C#" → "C\#", mas "\#" fica intacto)
+    .replace(/(?<!\)#/g, "\#")
+    // Escapa & não precedido de \ e não dentro de tabular/align
+    // (heurística: & precedido de espaço ou texto, não de { ou \ ou ^)
+    .replace(/(?<!\)&(?!\s*\)/g, (m, offset, str) => {
+      // Mantém & em ambientes de tabela: se a linha tem múltiplos &, é tabular
+      const line = str.slice(str.lastIndexOf("\n", offset) + 1,
+                             str.indexOf("\n", offset) >>> 0 || str.length);
+      const ampCount = (line.match(/(?<!\)&/g) || []).length;
+      return ampCount > 1 ? m : "\&";
+    });
+}
+
 function buildResult(raw, editedTex) {
   const metaStr = extractBetween(raw, "JSON_META_START", "JSON_META_END");
   let meta = { changes: [], cover_letter: "" };
@@ -193,5 +216,5 @@ function buildResult(raw, editedTex) {
     }
   }
 
-  return { ...meta, edited_tex: editedTex };
+  return { ...meta, edited_tex: sanitizeLatex(editedTex) };
 }
