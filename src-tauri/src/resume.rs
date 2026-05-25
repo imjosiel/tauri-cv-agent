@@ -147,7 +147,7 @@ fn load_packages() -> Result<Vec<SavedResumePackage>> {
             let p = asset.path();
             if !p.is_file() { continue; }
             let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
-            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "pdf" | "eps") {
+            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "pdf" | "eps" | "cls" | "sty" | "ttf" | "otf") {
                 let filename = p.file_name().unwrap().to_string_lossy().to_string();
                 if let Ok(data_url) = read_as_data_url(&p) {
                     asset_data.insert(filename, data_url);
@@ -180,6 +180,7 @@ fn read_as_data_url(path: &PathBuf) -> Result<String> {
         Some("gif")  => "image/gif",
         Some("svg")  => "image/svg+xml",
         Some("pdf")  => "application/pdf",
+        Some("cls") | Some("sty") | Some("ttf") | Some("otf") => "application/octet-stream",
         _            => "application/octet-stream",
     };
     Ok(format!("data:{};base64,{}", mime, B64.encode(&bytes)))
