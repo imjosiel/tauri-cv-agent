@@ -236,30 +236,9 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
                     log::info!("copy_assets: pulando placeholder '{}'", fname);
                     continue;
                 }
-                if ext == "sty" || ext == "cls" {
-                    // Copia arquivos de estilo aplicando patch de comandos unsafe
-                    match std::fs::read_to_string(&ap) {
-                        Ok(src) => {
-                            let patched_sty = patch_sty(&src);
-                            if let Err(e) = std::fs::write(&dest, patched_sty) {
-                                log::warn!("Falha ao escrever {:?}: {}", dest, e);
-                            } else {
-                                copied += 1;
-                            }
-                        }
-                        Err(_) => {
-                            // Fallback: copia binário se não conseguir ler como texto
-                            match std::fs::copy(&ap, &dest) {
-                                Ok(_) => copied += 1,
-                                Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
-                            }
-                        }
-                    }
-                } else {
-                    match std::fs::copy(&ap, &dest) {
-                        Ok(_) => copied += 1,
-                        Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
-                    }
+                match std::fs::copy(&ap, &dest) {
+                    Ok(_) => copied += 1,
+                    Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
                 }
             }
         }
