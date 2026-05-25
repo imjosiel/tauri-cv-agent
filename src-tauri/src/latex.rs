@@ -62,16 +62,13 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     let tex_path = out_dir.join("curriculo.tex");
     let pdf_path = out_dir.join("curriculo.pdf");
 
-    // Copia assets antes de patchear — assim sabemos o que realmente chegou no disco
+    // Copia assets e escreve o .tex original sem modificações
     copy_assets_to_output(&out_dir)?;
+    std::fs::write(&tex_path, tex_content)?;
 
-    // 1. Injeta redefinições seguras de \cvevent, \cvdegree, \roundpic
-    //    que verificam se o arquivo existe antes de chamar \includegraphics
-    let with_safe_cmds = inject_safe_commands(tex_content);
-
-    // 2. Substitui imagens faltantes por argumento vazio (já tratado pelas redefinições)
-    let patched = patch_missing_images(&with_safe_cmds, &out_dir);
-    std::fs::write(&tex_path, &patched)?;
+    // Cria arquivos dummy (PNG 1x1 transparente) para toda imagem referenciada
+    // no .tex que não existe no out_dir — funciona com qualquer template.
+    create_dummy_images(tex_content, &out_dir);
 
     // latexmk é preferível (resolve referências cruzadas automaticamente);
     // fallback para pdflatex com duas passagens manuais.
@@ -136,6 +133,69 @@ fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+/// Cria arquivos PNG dummy (1x1 pixel transparente) para toda imagem
+/// referenciada no .tex que não existe no diretório de saída.
+/// Funciona com qualquer template LaTeX — não depende de comandos específicos.
+fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
+    // PNG 1x1 transparente — mínimo válido que o pdflatex aceita
+    const DUMMY_PNG: &[u8] = &[
+        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+        0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
+        0x89,0x00,0x00,0x00,0x0A,0x49,0x44,0x41,
+        0x54,0x78,0x9C,0x62,0x00,0x01,0x00,0x00,
+        0x05,0x00,0x01,0x0D,0x0A,0x2D,0xB4,0x00,
+        0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,
+        0xAE,0x42,0x60,0x82,
+    ];
+
+    let placeholder_set = load_placeholder_set();
+
+    // Extrai todos os nomes de arquivo referenciados no .tex
+    // usando uma heurística simples: qualquer {palavra.ext} onde ext é imagem
+    let image_exts = ["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"];
+    let mut found = std::collections::HashSet::new();
+
+    let mut i = 0;
+    let bytes = tex.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'}' && bytes[i] != b'{' && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'}' {
+                let name = tex[start..i].trim();
+                let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                if image_exts.contains(&ext.as_str()) && !name.contains('\\') {
+                    found.insert(name.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    for name in found {
+        // Pula se está marcado como placeholder (já não existe no out_dir intencionalmente)
+        if placeholder_set.contains(&name) {
+            continue;
+        }
+
+        let dest = out_dir.join(&name);
+        if !dest.exists() {
+            // Tenta criar com a extensão original
+            if let Err(e) = std::fs::write(&dest, DUMMY_PNG) {
+                log::warn!("Não foi possível criar dummy para '{}': {}", name, e);
+            } else {
+                log::info!("Dummy criado: {:?}", dest);
+            }
+        }
+    }
 }
 
 /// Copia .cls, .sty, imagens e fontes de todos os pacotes salvos
@@ -213,45 +273,6 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
 /// Injeta redefinições de \cvevent, \cvdegree e \roundpic que verificam
 /// se o argumento de imagem está vazio antes de chamar \includegraphics.
 /// Isso evita "File '' not found" quando o placeholder está ativo.
-/// Injeta logo antes de \begin{document}.
-fn inject_safe_commands(tex: &str) -> String {
-    // Se já foi injetado (recompilação), não injeta de novo
-    if tex.contains("% cv-agent: safe image commands") {
-        return tex.to_string();
-    }
-
-    let safe_defs = r#"
-% cv-agent: safe image commands — redefine para ignorar imagem ausente
-\makeatletter
-\renewcommand{\cvevent}[6]{%
-  {#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline%
-  {\color{black!70}\footnotesize #5}\vspace{1.5em} &
-  \raisebox{-0.7\height}{%
-    \ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}%
-  }%
-}
-\renewcommand{\cvdegree}[6]{%
-  {#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline%
-  {\color{black!70}\scriptsize #5}\vspace{0.5em} &
-  \raisebox{-0.7\height}{%
-    \ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}%
-  }%
-}
-\renewcommand{\roundpic}[1]{%
-  \ifthenelse{\equal{#1}{}}{}%
-  {\begin{figure}[H]\tikz\draw[path picture={\node at (path picture bounding box.center)%
-    {\includegraphics[height=3.5cm]{#1}};}] (0,2) circle (1.7);\end{figure}}%
-}
-\makeatother
-"#;
-
-    if let Some(pos) = tex.find(r"\begin{document}") {
-        format!("{}{}{}", &tex[..pos], safe_defs, &tex[pos..])
-    } else {
-        format!("{}{}", tex, safe_defs)
-    }
-}
-
 /// Substitui referências a imagens ausentes por \phantom{} ou argumento vazio.
 ///
 /// Padrões tratados no simplehipstercv:
@@ -261,113 +282,7 @@ fn inject_safe_commands(tex: &str) -> String {
 ///   \cvdegree{}{}{}{}{}{file}         → \cvdegree{}{}{}{}{}{}
 ///
 /// A regra: arquivo ausente no out_dir (tamanho <= 100 bytes) ou marcado
-/// como placeholder → referência removida.
-fn patch_missing_images(tex: &str, out_dir: &PathBuf) -> String {
-    let placeholder_set = load_placeholder_set();
-
-    let valid = |filename: &str| -> bool {
-        if filename.is_empty() { return true; }
-        if placeholder_set.contains(filename) { return false; }
-        [
-            out_dir.join(filename),
-            out_dir.join(format!("{}.png", filename)),
-            out_dir.join(format!("{}.jpg", filename)),
-            out_dir.join(format!("{}.pdf", filename)),
-        ].iter().any(|p| p.metadata().map(|m| m.len() > 100).unwrap_or(false))
-    };
-
-    let mut out = String::with_capacity(tex.len());
-    for line in tex.split('\n') {
-        out.push_str(&patch_line(line, &valid));
-        out.push('\n');
-    }
-    if !tex.ends_with('\n') { out.pop(); }
-    out
-}
-
 /// Encontra o último argumento {conteudo} de um comando LaTeX na string.
-/// Retorna (índice_abre, índice_fecha, conteudo).
-fn last_brace_arg(s: &str, cmd: &str) -> Option<(usize, usize, String)> {
-    let cmd_pos = s.find(cmd)?;
-    let mut i = cmd_pos + cmd.len();
-    let b = s.as_bytes();
-    let mut last: Option<(usize, usize)> = None;
-
-    while i < b.len() {
-        match b[i] {
-            b' ' | b'\t' => { i += 1; }
-            b'[' => {
-                i += 1;
-                let mut d = 1usize;
-                while i < b.len() && d > 0 {
-                    match b[i] { b'[' => d += 1, b']' => d -= 1, _ => {} }
-                    i += 1;
-                }
-            }
-            b'{' => {
-                let open = i;
-                i += 1;
-                let mut d = 1usize;
-                while i < b.len() && d > 0 {
-                    match b[i] { b'{' => d += 1, b'}' => { d -= 1; } _ => {} }
-                    i += 1;
-                }
-                last = Some((open, i - 1));
-            }
-            _ => break,
-        }
-    }
-
-    let (open, close) = last?;
-    let content = s[open + 1..close].trim().to_string();
-    Some((open, close, content))
-}
-
-fn patch_line(line: &str, valid: &dyn Fn(&str) -> bool) -> String {
-    let mut s = line.to_string();
-
-    // ── \includegraphics ─────────────────────────────────────────────────────
-    if s.contains("\\includegraphics") {
-        if let Some((open, close, filename)) = last_brace_arg(&s, "\\includegraphics") {
-            if !valid(&filename) {
-                log::info!("patch: phantom includegraphics '{}'", filename);
-                // Encontra início do comando na string
-                let cmd_start = s.find("\\includegraphics").unwrap();
-                let cmd_end   = close + 1;
-                let inner = s[cmd_start..cmd_end].to_string();
-                s = format!("{}\\phantom{{{}}}{}",
-                    &s[..cmd_start], inner, &s[cmd_end..]);
-            }
-        }
-    }
-
-    // ── \roundpic ────────────────────────────────────────────────────────────
-    if s.contains("\\roundpic") {
-        if let Some((open, close, filename)) = last_brace_arg(&s, "\\roundpic") {
-            if !valid(&filename) {
-                log::info!("patch: empty roundpic '{}'", filename);
-                // {filename} → {}
-                s = format!("{}{{}}{}", &s[..open], &s[close + 1..]);
-            }
-        }
-    }
-
-    // ── \cvevent, \cvdegree e similares — último {} é a imagem ───────────────
-    for cmd in &["\\cvevent", "\\cvdegree", "\\cvpub", "\\cvproject"] {
-        if !s.contains(cmd) { continue; }
-        if let Some((open, close, filename)) = last_brace_arg(&s, cmd) {
-            if !filename.is_empty() && !valid(&filename) {
-                log::info!("patch: empty {} image arg '{}'", cmd, filename);
-                // {filename} → {}
-                s = format!("{}{{}}{}", &s[..open], &s[close + 1..]);
-            }
-        }
-        break; // cada linha tem no máximo um \cvevent
-    }
-
-    s
-}
-
 /// Parseia \includegraphics[opções]{arquivo} e retorna (match_completo, filename).
 fn parse_includegraphics(s: &str) -> Option<(&str, String)> {
     let mut idx = "\\includegraphics".len();
@@ -416,23 +331,6 @@ fn parse_includegraphics(s: &str) -> Option<(&str, String)> {
 
 /// Aplica substituições seguras no .sty do simplehipstercv:
 /// \cvevent, \cvdegree e \roundpic passam a verificar se o argumento
-/// de imagem está vazio antes de chamar \includegraphics.
-fn patch_sty(sty: &str) -> String {
-    sty
-    .replace(
-        r"\newcommand{\roundpic}[1]{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}",
-        r"\newcommand{\roundpic}[1]{\ifthenelse{\equal{#1}{}}{}{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}}"
-    )
-    .replace(
-        r"\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\includegraphics[height=1cm]{#6}}}",
-        r"\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}}}"
-    )
-    .replace(
-        r"\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\includegraphics[height=0.5cm]{#6}}}",
-        r"\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}}}"
-    )
-}
-
 /// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
 fn load_placeholder_set() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
