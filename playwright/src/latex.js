@@ -85,142 +85,6 @@ function loadPlaceholderSet() {
 }
 
 // Encontra o último argumento {conteudo} de um comando LaTeX.
-// Retorna { open, close, content } onde open/close são índices do { e }.
-function lastBraceArg(s, cmd) {
-  const cmdPos = s.indexOf(cmd);
-  if (cmdPos === -1) return null;
-  let i = cmdPos + cmd.length;
-  let last = null;
-
-  while (i < s.length) {
-    const ch = s[i];
-    if (ch === " " || ch === "\t") { i++; continue; }
-    if (ch === "[") {
-      i++;
-      let d = 1;
-      while (i < s.length && d > 0) {
-        if (s[i] === "[") d++;
-        else if (s[i] === "]") d--;
-        i++;
-      }
-      continue;
-    }
-    if (ch === "{") {
-      const open = i;
-      i++;
-      let d = 1;
-      while (i < s.length && d > 0) {
-        if (s[i] === "{") d++;
-        else if (s[i] === "}") d--;
-        i++;
-      }
-      last = { open, close: i - 1 };
-      continue;
-    }
-    break;
-  }
-
-  if (!last) return null;
-  const content = s.slice(last.open + 1, last.close).trim();
-  return { open: last.open, close: last.close, content };
-}
-
-// Injeta redefinições LaTeX de \cvevent, \cvdegree e \roundpic que usam
-// \ifthenelse para ignorar o argumento de imagem quando estiver vazio.
-function injectSafeCommands(tex) {
-  if (tex.includes("% cv-agent: safe image commands")) return tex;
-
-  const safeDefs = `
-% cv-agent: safe image commands — redefine para ignorar imagem ausente
-\\makeatletter
-\\renewcommand{\\cvevent}[6]{%
-  {#1} & \\textbf{#2}\\newline\\textsc{#3} $\\cdot$ {#4 ~\\faMapMarker}\\newline%
-  {\\color{black!70}\\footnotesize #5}\\vspace{1.5em} &
-  \\raisebox{-0.7\\height}{%
-    \\ifthenelse{\\equal{#6}{}}{}{\\includegraphics[height=1cm]{#6}}%
-  }%
-}
-\\renewcommand{\\cvdegree}[6]{%
-  {#1} & \\textbf{#2}\\newline\\textsc{#3} $\\cdot$ {#4 {\\phantom{i}\\footnotesize ~\\faUniversity}}\\newline%
-  {\\color{black!70}\\scriptsize #5}\\vspace{0.5em} &
-  \\raisebox{-0.7\\height}{%
-    \\ifthenelse{\\equal{#6}{}}{}{\\includegraphics[height=0.5cm]{#6}}%
-  }%
-}
-\\renewcommand{\\roundpic}[1]{%
-  \\ifthenelse{\\equal{#1}{}}{}{%
-    \\begin{figure}[H]\\tikz\\draw[path picture={\\node at (path picture bounding box.center)%
-      {\\includegraphics[height=3.5cm]{#1}};}] (0,2) circle (1.7);\\end{figure}}%
-}
-\\makeatother
-`;
-
-  const pos = tex.indexOf("\\begin{document}");
-  if (pos !== -1) {
-    return tex.slice(0, pos) + safeDefs + tex.slice(pos);
-  }
-  return tex + safeDefs;
-}
-
-
-function patchLine(line, valid) {
-  let s = line;
-
-  // \includegraphics
-  if (s.includes("\\includegraphics")) {
-    const r = lastBraceArg(s, "\\includegraphics");
-    if (r && !valid(r.content)) {
-      const cmdStart = s.indexOf("\\includegraphics");
-      const cmdEnd   = r.close + 1;
-      const inner    = s.slice(cmdStart, cmdEnd);
-      s = s.slice(0, cmdStart) + `\\phantom{${inner}}` + s.slice(cmdEnd);
-    }
-  }
-
-  // \roundpic
-  if (s.includes("\\roundpic")) {
-    const r = lastBraceArg(s, "\\roundpic");
-    if (r && !valid(r.content)) {
-      s = s.slice(0, r.open) + "{}" + s.slice(r.close + 1);
-    }
-  }
-
-  // \cvevent, \cvdegree, etc — último {} é a imagem
-  for (const cmd of ["\\cvevent", "\\cvdegree", "\\cvpub", "\\cvproject"]) {
-    if (!s.includes(cmd)) continue;
-    const r = lastBraceArg(s, cmd);
-    if (r && r.content && !valid(r.content)) {
-      console.log(`[latex] patch ${cmd} image: '${r.content}'`);
-      s = s.slice(0, r.open) + "{}" + s.slice(r.close + 1);
-    }
-    break;
-  }
-
-  return s;
-}
-
-function patchMissingImages(tex, jobDir) {
-
-  const placeholders = loadPlaceholderSet();
-
-  function valid(filename) {
-    if (!filename) return true;
-    if (placeholders.has(filename)) return false;
-    const candidates = [
-      join(jobDir, filename),
-      join(jobDir, filename + ".png"),
-      join(jobDir, filename + ".jpg"),
-      join(jobDir, filename + ".pdf"),
-    ];
-    return candidates.some((p) => {
-      try { return require("fs").statSync(p).size > 100; } catch { return false; }
-    });
-  }
-
-  const lines = tex.split("\n");
-  return lines.map((line) => patchLine(line, valid)).join("\n");
-}
-
 // ── Compilação ────────────────────────────────────────────────────────────────
 
 export async function compileLaTeX(texContent, jobId) {
@@ -230,15 +94,12 @@ export async function compileLaTeX(texContent, jobId) {
   const texPath = join(jobDir, "curriculo.tex");
   const pdfPath = join(jobDir, "curriculo.pdf");
 
-  // 1. Copia assets primeiro — assim patchMissingImages sabe o que existe
+  // Copia assets e escreve o .tex original sem modificações
   copyAssetsToOutput(jobDir);
+  writeFileSync(texPath, texContent, "utf8");
 
-  // 2. Injeta redefinições seguras de \cvevent, \cvdegree, \roundpic
-  const withSafeCmds = injectSafeCommands(texContent);
-
-  // 3. Substitui imagens faltantes por argumento vazio (tratado pelas redefinições)
-  const patched = patchMissingImages(withSafeCmds, jobDir);
-  writeFileSync(texPath, patched, "utf8");
+  // Cria PNGs dummy (1x1 transparente) para imagens ausentes — funciona com qualquer template
+  createDummyImages(texContent, jobDir);
 
   const env  = buildEnv();
   const opts = { timeout: 120_000, stdio: "pipe", env };
@@ -292,21 +153,51 @@ export async function compileLaTeX(texContent, jobId) {
 
 // Aplica substituições seguras no simplehipstercv.sty copiado para o output.
 // Adiciona \ifthenelse{\equal{#6}{}} em \cvevent, \cvdegree e \roundpic
-// para que argumentos de imagem vazios sejam ignorados silenciosamente.
-function patchSty(sty) {
-  return sty
-    .replace(
-      String.raw`\newcommand{\roundpic}[1]{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}`,
-      String.raw`\newcommand{\roundpic}[1]{\ifthenelse{\equal{#1}{}}{}{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}}`
-    )
-    .replace(
-      String.raw`\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\includegraphics[height=1cm]{#6}}}`,
-      String.raw`\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}}}`
-    )
-    .replace(
-      String.raw`\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\includegraphics[height=0.5cm]{#6}}}`,
-      String.raw`\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}}}`
-    );
+// PNG 1x1 transparente — mínimo válido que o pdflatex aceita
+const DUMMY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGIAAQAABQABDQottAAAAAAASUVORK5CYII=",
+  "base64"
+);
+
+// Cria arquivos PNG dummy para toda imagem referenciada no .tex que não existe.
+// Funciona com qualquer template LaTeX — não depende de comandos específicos.
+function createDummyImages(tex, jobDir) {
+  const placeholders = loadPlaceholderSet();
+  const imageExts = new Set(["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"]);
+
+  // Extrai {arquivo.ext} de qualquer lugar no .tex
+  const found = new Set();
+  let i = 0;
+  while (i < tex.length) {
+    if (tex[i] === "{") {
+      const start = i + 1;
+      let j = start;
+      while (j < tex.length && tex[j] !== "}" && tex[j] !== "{" && tex[j] !== "\n") j++;
+      if (tex[j] === "}") {
+        const name = tex.slice(start, j).trim();
+        const ext  = name.split(".").pop()?.toLowerCase() ?? "";
+        if (imageExts.has(ext) && !name.includes("\\")) {
+          found.add(name);
+        }
+      }
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+
+  for (const name of found) {
+    if (placeholders.has(name)) continue; // placeholder intencional — não cria dummy
+    const dest = join(jobDir, name);
+    if (!existsSync(dest)) {
+      try {
+        require("fs").writeFileSync(dest, DUMMY_PNG);
+        console.log(`[latex] dummy criado: ${name}`);
+      } catch (e) {
+        console.warn(`[latex] não foi possível criar dummy para '${name}': ${e.message}`);
+      }
+    }
+  }
 }
 
 
