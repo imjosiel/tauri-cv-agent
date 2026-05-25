@@ -176,9 +176,30 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
                     log::info!("copy_assets: pulando placeholder '{}'", fname);
                     continue;
                 }
-                match std::fs::copy(&ap, &dest) {
-                    Ok(_) => copied += 1,
-                    Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
+                if ext == "sty" || ext == "cls" {
+                    // Copia arquivos de estilo aplicando patch de comandos unsafe
+                    match std::fs::read_to_string(&ap) {
+                        Ok(src) => {
+                            let patched_sty = patch_sty(&src);
+                            if let Err(e) = std::fs::write(&dest, patched_sty) {
+                                log::warn!("Falha ao escrever {:?}: {}", dest, e);
+                            } else {
+                                copied += 1;
+                            }
+                        }
+                        Err(_) => {
+                            // Fallback: copia binário se não conseguir ler como texto
+                            match std::fs::copy(&ap, &dest) {
+                                Ok(_) => copied += 1,
+                                Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
+                            }
+                        }
+                    }
+                } else {
+                    match std::fs::copy(&ap, &dest) {
+                        Ok(_) => copied += 1,
+                        Err(e) => log::warn!("Falha ao copiar {:?}: {}", ap, e),
+                    }
                 }
             }
         }
@@ -391,6 +412,25 @@ fn parse_includegraphics(s: &str) -> Option<(&str, String)> {
     if filename.is_empty() { return None; }
 
     Some((&s[..idx], filename))
+}
+
+/// Aplica substituições seguras no .sty do simplehipstercv:
+/// \cvevent, \cvdegree e \roundpic passam a verificar se o argumento
+/// de imagem está vazio antes de chamar \includegraphics.
+fn patch_sty(sty: &str) -> String {
+    sty
+    .replace(
+        r"\newcommand{\roundpic}[1]{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}",
+        r"\newcommand{\roundpic}[1]{\ifthenelse{\equal{#1}{}}{}{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}}"
+    )
+    .replace(
+        r"\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\includegraphics[height=1cm]{#6}}}",
+        r"\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}}}"
+    )
+    .replace(
+        r"\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\includegraphics[height=0.5cm]{#6}}}",
+        r"\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}}}"
+    )
 }
 
 /// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
