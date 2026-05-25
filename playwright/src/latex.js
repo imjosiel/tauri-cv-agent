@@ -215,13 +215,7 @@ function copyAssetsToOutput(jobDir) {
       return;
     }
     try {
-      if (name.endsWith(".sty") || name.endsWith(".cls")) {
-        // Aplica patch seguro no .sty/.cls antes de copiar
-        const src_content = readFileSync(src, "utf8");
-        writeFileSync(join(jobDir, name), patchSty(src_content), "utf8");
-      } else {
-        copyFileSync(src, join(jobDir, name));
-      }
+      copyFileSync(src, join(jobDir, name));
       count++;
     } catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
   }
