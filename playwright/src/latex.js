@@ -290,6 +290,26 @@ export async function compileLaTeX(texContent, jobId) {
   return pdfPath;
 }
 
+// Aplica substituições seguras no simplehipstercv.sty copiado para o output.
+// Adiciona \ifthenelse{\equal{#6}{}} em \cvevent, \cvdegree e \roundpic
+// para que argumentos de imagem vazios sejam ignorados silenciosamente.
+function patchSty(sty) {
+  return sty
+    .replace(
+      String.raw`\newcommand{\roundpic}[1]{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}`,
+      String.raw`\newcommand{\roundpic}[1]{\ifthenelse{\equal{#1}{}}{}{\begin{figure}[H]\tikz  \draw [path picture={ \node at (path picture bounding box.center){\includegraphics[height=3.5cm]{#1}} ;}] (0,2) circle (1.7) ;\end{figure}}}`
+    )
+    .replace(
+      String.raw`\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\includegraphics[height=1cm]{#6}}}`,
+      String.raw`\newcommand{\cvevent}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 ~\faMapMarker}\newline{\color{black!70}\footnotesize #5}\vspace{1.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=1cm]{#6}}}}`
+    )
+    .replace(
+      String.raw`\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\includegraphics[height=0.5cm]{#6}}}`,
+      String.raw`\newcommand{\cvdegree}[6]{{#1} & \textbf{#2}\newline\textsc{#3} $\cdot$ {#4 {\phantom{i}\footnotesize ~\faUniversity}}\newline{\color{black!70}\scriptsize #5}\vspace{0.5em} & \raisebox{-0.7\height}{\ifthenelse{\equal{#6}{}}{}{\includegraphics[height=0.5cm]{#6}}}}`
+    );
+}
+
+
 function copyAssetsToOutput(jobDir) {
   if (!existsSync(TPL_DIR)) return;
 
@@ -303,8 +323,16 @@ function copyAssetsToOutput(jobDir) {
       console.log(`[latex] Pulando placeholder: ${name}`);
       return;
     }
-    try { copyFileSync(src, join(jobDir, name)); count++; }
-    catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
+    try {
+      if (name.endsWith(".sty") || name.endsWith(".cls")) {
+        // Aplica patch seguro no .sty/.cls antes de copiar
+        const src_content = readFileSync(src, "utf8");
+        writeFileSync(join(jobDir, name), patchSty(src_content), "utf8");
+      } else {
+        copyFileSync(src, join(jobDir, name));
+      }
+      count++;
+    } catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
   }
 
   for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
