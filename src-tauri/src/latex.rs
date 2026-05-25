@@ -262,55 +262,6 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
 ///
 /// A regra: arquivo ausente no out_dir (tamanho <= 100 bytes) ou marcado
 /// Encontra o último argumento {conteudo} de um comando LaTeX na string.
-/// Parseia \includegraphics[opções]{arquivo} e retorna (match_completo, filename).
-fn parse_includegraphics(s: &str) -> Option<(&str, String)> {
-    let mut idx = "\\includegraphics".len();
-    if idx >= s.len() { return None; }
-
-    // Pula espaços
-    while idx < s.len() && s.as_bytes()[idx].is_ascii_whitespace() { idx += 1; }
-
-    // Pula [opções] se presente
-    if s.as_bytes().get(idx) == Some(&b'[') {
-        idx += 1;
-        let mut depth = 1usize;
-        while idx < s.len() && depth > 0 {
-            match s.as_bytes()[idx] {
-                b'[' => depth += 1,
-                b']' => depth -= 1,
-                _ => {}
-            }
-            idx += 1;
-        }
-    }
-
-    // Pula espaços
-    while idx < s.len() && s.as_bytes()[idx].is_ascii_whitespace() { idx += 1; }
-
-    // Extrai {filename}
-    if s.as_bytes().get(idx) != Some(&b'{') { return None; }
-    idx += 1;
-    let name_start = idx;
-    let mut depth = 1usize;
-    while idx < s.len() && depth > 0 {
-        match s.as_bytes()[idx] {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            _ => {}
-        }
-        idx += 1;
-    }
-    if depth != 0 { return None; }
-
-    let filename = s[name_start..idx - 1].trim().to_string();
-    if filename.is_empty() { return None; }
-
-    Some((&s[..idx], filename))
-}
-
-/// Aplica substituições seguras no .sty do simplehipstercv:
-/// \cvevent, \cvdegree e \roundpic passam a verificar se o argumento
-/// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
 fn load_placeholder_set() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     let tpl_dir = templates_dir();
