@@ -10,13 +10,8 @@ import styles from "./PageResumes.module.css";
 function extractImageRefs(tex: string): string[] {
   const refs = new Set<string>();
 
-  const classPattern = /\\documentclass(?:\[[^\]]*\])?\{([^}]+)\}/g;
-  let m: RegExpExecArray | null;
-  while ((m = classPattern.exec(tex)) !== null) {
-    const cls = m[1].trim().split(",")[0];
-    if (cls) refs.add(`${cls}.cls`);
-  }
-
+  // Nota: .cls e .sty são copiados automaticamente como estilo, não como assets visuais.
+  // Não os incluímos aqui para evitar que apareçam na lista de imagens gerenciáveis.
   const patterns = [
     /\\includegraphics(?:\[.*?\])?\{([^}]+)\}/g,
     /\\roundpic\{([^}]+)\}/g,
