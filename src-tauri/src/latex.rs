@@ -181,11 +181,7 @@ fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
     }
 
     for name in found {
-        // Pula se está marcado como placeholder (já não existe no out_dir intencionalmente)
-        if placeholder_set.contains(&name) {
-            continue;
-        }
-
+        // Cria dummy mesmo para placeholders — o pdflatex precisa do arquivo no disco
         let dest = out_dir.join(&name);
         if !dest.exists() {
             // Tenta criar com a extensão original
