@@ -187,7 +187,9 @@ function createDummyImages(tex, jobDir) {
   }
 
   for (const name of found) {
-    if (placeholders.has(name)) continue; // placeholder intencional — não cria dummy
+    // Cria dummy mesmo para placeholders — o pdflatex precisa do arquivo no disco
+    // O "placeholder" significa apenas que o usuário não tem a imagem real,
+    // mas o dummy 1x1 garante que o pdflatex não quebre
     const dest = join(jobDir, name);
     if (!existsSync(dest)) {
       try {
