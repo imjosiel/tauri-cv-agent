@@ -84,7 +84,6 @@ function loadPlaceholderSet() {
   return placeholders;
 }
 
-// Encontra o último argumento {conteudo} de um comando LaTeX.
 // ── Compilação ────────────────────────────────────────────────────────────────
 
 export async function compileLaTeX(texContent, jobId) {
@@ -151,8 +150,6 @@ export async function compileLaTeX(texContent, jobId) {
   return pdfPath;
 }
 
-// Aplica substituições seguras no simplehipstercv.sty copiado para o output.
-// Adiciona \ifthenelse{\equal{#6}{}} em \cvevent, \cvdegree e \roundpic
 // PNG 1x1 transparente — mínimo válido que o pdflatex aceita
 const DUMMY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGIAAQAABQABDQottAAAAAAASUVORK5CYII=",
@@ -193,7 +190,7 @@ function createDummyImages(tex, jobDir) {
     const dest = join(jobDir, name);
     if (!existsSync(dest)) {
       try {
-        require("fs").writeFileSync(dest, DUMMY_PNG);
+        writeFileSync(dest, DUMMY_PNG);
         console.log(`[latex] dummy criado: ${name}`);
       } catch (e) {
         console.warn(`[latex] não foi possível criar dummy para '${name}': ${e.message}`);
