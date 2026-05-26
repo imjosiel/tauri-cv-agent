@@ -43,6 +43,10 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
             emit(&app, "night_error", serde_json::json!({ "error": friendly }));
         }
     }
+    // Reseta o flag — permite iniciar um novo ciclo noturno sem reiniciar o app
+    if let Ok(state) = app.try_state::<crate::AppState>() {
+        *state.running.lock().unwrap() = false;
+    }
 }
 
 async fn run_playwright(
