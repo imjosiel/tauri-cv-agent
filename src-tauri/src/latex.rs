@@ -257,7 +257,7 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
 ///   \cvdegree{}{}{}{}{}{file}         → \cvdegree{}{}{}{}{}{}
 ///
 /// A regra: arquivo ausente no out_dir (tamanho <= 100 bytes) ou marcado
-/// Encontra o último argumento {conteudo} de um comando LaTeX na string.
+/// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
 fn load_placeholder_set() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     let tpl_dir = templates_dir();
