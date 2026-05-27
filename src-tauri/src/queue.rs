@@ -1,5 +1,5 @@
 // src-tauri/src/queue.rs
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use serde_json::Value;
 use std::io::Write;
@@ -44,7 +44,7 @@ pub async fn run_night_mode(app: AppHandle, config: NightConfig, query: String) 
         }
     }
     // Reseta o flag — permite iniciar um novo ciclo noturno sem reiniciar o app
-    if let Ok(state) = app.try_state::<crate::AppState>() {
+    if let Some(state) = app.try_state::<crate::AppState>() {
         *state.running.lock().unwrap() = false;
     }
 }
