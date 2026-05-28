@@ -152,8 +152,6 @@ fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
         0xAE,0x42,0x60,0x82,
     ];
 
-    let placeholder_set = load_placeholder_set();
-
     // Extrai todos os nomes de arquivo referenciados no .tex
     // usando uma heurística simples: qualquer {palavra.ext} onde ext é imagem
     let image_exts = ["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"];
