@@ -6,41 +6,59 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
   const encoded = encodeURIComponent(query);
   try {
-    await page.goto(`https://www.catho.com.br/vagas/${encoded}/`, {
+    // URL correta da Catho: query param "q", não path segment
+    await page.goto(`https://www.catho.com.br/vagas/?q=${encoded}&periodo=1`, {
       waitUntil: "domcontentloaded", timeout: 30000
     });
-    await humanDelay(1500, 2500);
+    await humanDelay(2000, 3500);
 
     if (await checkCaptcha(page)) {
       emit("captcha_detected", { site: "catho" });
-      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
-        return jobs;
-      }
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
     }
 
-    const cards = await page.$$('[data-testid="job-card"], .sc-jqUVSM, [class*="JobCard"]');
+    // Aguarda cards
+    await page.waitForSelector(
+      '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"]',
+      { timeout: 20000 }
+    ).catch(() => {});
+
+    const cards = await page.$$(
+      '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"], [class*="jobCard"]'
+    );
+    emit("progress", { message: `Catho: ${cards.length} cards encontrados` });
+
     for (const card of cards.slice(0, 15)) {
       try {
-        const title    = await card.$eval('h2, [data-testid="job-title"], [class*="title"]', el => el.innerText.trim()).catch(() => "");
-        const company  = await card.$eval('[data-testid="company-name"], [class*="company"]', el => el.innerText.trim()).catch(() => "");
-        const link     = await card.$eval('a', el => el.href).catch(() => "");
-        const location = await card.$eval('[class*="location"], [data-testid="location"]', el => el.innerText.trim()).catch(() => "");
+        const title = await card.$eval(
+          'h2, [data-testid="job-title"], [class*="JobTitle"], [class*="title"]',
+          (el) => el.innerText.trim()
+        ).catch(() => "");
+        const company = await card.$eval(
+          '[data-testid="company-name"], [class*="CompanyName"], [class*="company"]',
+          (el) => el.innerText.trim()
+        ).catch(() => "");
+        const location = await card.$eval(
+          '[data-testid="location"], [class*="Location"], [class*="location"]',
+          (el) => el.innerText.trim()
+        ).catch(() => "");
+        const link = await card.$eval("a", (el) => el.href).catch(() => "");
         if (!title || !link) continue;
 
         let description = "";
         const det = await page.context().newPage();
         try {
-          await det.goto(link, { waitUntil: "domcontentloaded", timeout: 15000 });
-          description = await det.$eval('[data-testid="job-description"], .job-description, [class*="Description"]', el => el.innerText.trim()).catch(() => "");
+          await det.goto(link, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await humanDelay(800, 1500);
+          description = await det.$eval(
+            '[data-testid="job-description"], [class*="Description"], [class*="description"], .job-description',
+            (el) => el.innerText.trim()
+          ).catch(() => "");
         } finally { await det.close(); }
 
-        jobs.push({
-          id: `ca-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
-          title, company, location, url: link, apply_url: link,
-          site: "catho",
-          description: description.slice(0, 3000)
-        });
-        emit("job_found", { title, company, site: "catho", location });
+        const jobId = `ca-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        jobs.push({ id: jobId, title, company, location, url: link, apply_url: link, site: "catho", description: description.slice(0, 3000) });
+        emit("job_found", { id: jobId, title, company, site: "catho", location, url: link, description: description.slice(0, 300) });
       } catch {}
       await humanDelay(400, 800);
     }
@@ -53,13 +71,10 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
 export async function applyCatho(page, pdfPath, _coverLetter) {
   await humanDelay(1000, 2000);
   if (await checkCaptcha(page)) return { success: false, captcha: true };
-
-  const btn = await page.$('[data-testid="apply-button"], button.apply-btn, [class*="apply"]');
+  const btn = await page.$('[data-testid="apply-button"], [class*="ApplyButton"], button[class*="apply"]');
   if (!btn) return { success: false, reason: "Botão candidatar não encontrado na Catho" };
-
   await btn.click();
   await humanDelay(2000, 3000);
-
-  const confirmed = await waitForVisible(page, '[data-testid="apply-success"], .application-success', 8000);
+  const confirmed = await waitForVisible(page, '[data-testid="apply-success"], [class*="success"], .application-success', 8000);
   return { success: confirmed, reason: confirmed ? undefined : "Confirmação Catho não detectada" };
 }
