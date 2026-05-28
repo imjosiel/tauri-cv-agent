@@ -62,16 +62,18 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     let tex_path = out_dir.join("curriculo.tex");
     let pdf_path = out_dir.join("curriculo.pdf");
 
-    // Copia assets e escreve o .tex original sem modificações
+    // 1. Copia assets reais dos templates para o diretório de saída
     copy_assets_to_output(&out_dir)?;
+
+    // 2. Escreve o .tex
     std::fs::write(&tex_path, tex_content)?;
 
-    // Cria arquivos dummy (PNG 1x1 transparente) para toda imagem referenciada
-    // no .tex que não existe no out_dir — funciona com qualquer template.
-    create_dummy_images(tex_content, &out_dir);
+    // 3. Para cada referência de asset no .tex, garante que existe algo no out_dir:
+    //    - imagem: cria PNG dummy 1×1 (não quebra o pdflatex, só fica em branco)
+    //    - .cls/.sty: cria stub mínimo (evita "File not found" fatal)
+    //    Também resolve referências com subpasta e extensão alternativa.
+    ensure_assets(tex_content, &out_dir);
 
-    // latexmk é preferível (resolve referências cruzadas automaticamente);
-    // fallback para pdflatex com duas passagens manuais.
     let ok = try_latexmk(&out_dir).or_else(|_| try_pdflatex(&out_dir))?;
 
     if !ok {
@@ -135,30 +137,125 @@ fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
     Ok(true)
 }
 
-/// Cria arquivos PNG dummy (1x1 pixel transparente) para toda imagem
-/// referenciada no .tex que não existe no diretório de saída.
-/// Funciona com qualquer template LaTeX — não depende de comandos específicos.
-fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
-    // PNG 1x1 transparente — mínimo válido que o pdflatex aceita
-    const DUMMY_PNG: &[u8] = &[
-        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
-        0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
-        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
-        0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
-        0x89,0x00,0x00,0x00,0x0A,0x49,0x44,0x41,
-        0x54,0x78,0x9C,0x62,0x00,0x01,0x00,0x00,
-        0x05,0x00,0x01,0x0D,0x0A,0x2D,0xB4,0x00,
-        0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,
-        0xAE,0x42,0x60,0x82,
-    ];
+// ── PNG 1×1 transparente ──────────────────────────────────────────────────────
+const DUMMY_PNG: &[u8] = &[
+    0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+    0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+    0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
+    0x89,0x00,0x00,0x00,0x0A,0x49,0x44,0x41,
+    0x54,0x78,0x9C,0x62,0x00,0x01,0x00,0x00,
+    0x05,0x00,0x01,0x0D,0x0A,0x2D,0xB4,0x00,
+    0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,
+    0xAE,0x42,0x60,0x82,
+];
 
-    // Extrai todos os nomes de arquivo referenciados no .tex
-    // usando uma heurística simples: qualquer {palavra.ext} onde ext é imagem
-    let image_exts = ["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"];
-    let mut found = std::collections::HashSet::new();
+// Extensões de imagem e de estilo LaTeX que tratamos
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"];
+const STYLE_EXTS: &[&str] = &["cls", "sty"];
 
-    let mut i = 0;
+/// Garante que todo asset referenciado no .tex existe no out_dir antes da compilação.
+///
+/// Três situações cobertas:
+/// 1. **Subpasta** — `\includegraphics{img/foto.png}`: cria `out_dir/img/` e o dummy lá dentro.
+/// 2. **Extensão alternativa** — referência é `foto.png` mas existe `foto.jpg` no out_dir:
+///    copia o arquivo existente com o nome esperado pelo .tex.
+/// 3. **.cls/.sty ausente** — cria um stub LaTeX mínimo para evitar "File not found" fatal.
+fn ensure_assets(tex: &str, out_dir: &PathBuf) {
+    let refs = collect_asset_refs(tex);
+
+    for ref_path in refs {
+        let dest = out_dir.join(&ref_path);
+
+        // Já existe — nada a fazer
+        if dest.exists() {
+            continue;
+        }
+
+        let ext = std::path::Path::new(&ref_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Garante que o diretório pai existe (cobre referências com subpasta)
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("ensure_assets: não foi possível criar diretório {:?}: {}", parent, e);
+                continue;
+            }
+        }
+
+        let stem = std::path::Path::new(&ref_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if IMAGE_EXTS.contains(&ext.as_str()) {
+            // FIX 2: tenta extensão alternativa já copiada para out_dir (flat)
+            let alt = find_alt_ext(out_dir, &stem, IMAGE_EXTS);
+            if let Some(src) = alt {
+                log::info!("ensure_assets: usando '{}' como substituto para '{}'", src.display(), ref_path);
+                if let Err(e) = std::fs::copy(&src, &dest) {
+                    log::warn!("ensure_assets: falha ao copiar alternativo {:?}: {}", src, e);
+                    // Fallback: cria dummy mesmo assim
+                    write_dummy_image(&dest, &ref_path);
+                }
+            } else {
+                // FIX 1: cria PNG dummy (subpasta já foi criada acima)
+                write_dummy_image(&dest, &ref_path);
+            }
+        } else if STYLE_EXTS.contains(&ext.as_str()) {
+            // FIX 3: cria stub mínimo de .cls/.sty para evitar erro fatal
+            write_style_stub(&dest, &ref_path, &ext);
+        }
+    }
+}
+
+fn write_dummy_image(dest: &PathBuf, name: &str) {
+    if let Err(e) = std::fs::write(dest, DUMMY_PNG) {
+        log::warn!("ensure_assets: não foi possível criar dummy para '{}': {}", name, e);
+    } else {
+        log::info!("ensure_assets: dummy PNG criado para '{}'", name);
+    }
+}
+
+fn write_style_stub(dest: &PathBuf, name: &str, ext: &str) {
+    // Stub mínimo válido: apenas um comentário. O pdflatex não falha ao carregar,
+    // mas o layout pode ficar incorreto caso o .cls/sty seja essencial.
+    let stub = if ext == "cls" {
+        "\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesClass{stub}[2024/01/01 auto-generated stub]\n\\LoadClass{article}\n"
+    } else {
+        "% auto-generated stub\n"
+    };
+    if let Err(e) = std::fs::write(dest, stub) {
+        log::warn!("ensure_assets: não foi possível criar stub para '{}': {}", name, e);
+    } else {
+        log::info!("ensure_assets: stub {} criado para '{}'", ext, name);
+    }
+}
+
+/// Procura no out_dir um arquivo com o mesmo stem mas extensão diferente.
+fn find_alt_ext(out_dir: &PathBuf, stem: &str, exts: &[&str]) -> Option<PathBuf> {
+    for ext in exts {
+        let candidate = out_dir.join(format!("{}.{}", stem, ext));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Extrai todos os nomes de asset referenciados no .tex.
+/// Cobre \includegraphics, \roundpic, \documentclass e referências genéricas {arquivo.ext}.
+fn collect_asset_refs(tex: &str) -> Vec<String> {
+    let mut refs = std::collections::HashSet::new();
+    let all_exts: Vec<&str> = IMAGE_EXTS.iter().chain(STYLE_EXTS.iter()).copied().collect();
+
+    // Varredura genérica: qualquer {nome.ext} conhecido
     let bytes = tex.as_bytes();
+    let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             i += 1;
@@ -169,8 +266,8 @@ fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
             if i < bytes.len() && bytes[i] == b'}' {
                 let name = tex[start..i].trim();
                 let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-                if image_exts.contains(&ext.as_str()) && !name.contains('\\') {
-                    found.insert(name.to_string());
+                if all_exts.contains(&ext.as_str()) && !name.contains('\\') && !name.is_empty() {
+                    refs.insert(name.to_string());
                 }
             }
         } else {
@@ -178,24 +275,34 @@ fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
         }
     }
 
-    for name in found {
-        // Cria dummy mesmo para placeholders — o pdflatex precisa do arquivo no disco
-        let dest = out_dir.join(&name);
-        if !dest.exists() {
-            // Tenta criar com a extensão original
-            if let Err(e) = std::fs::write(&dest, DUMMY_PNG) {
-                log::warn!("Não foi possível criar dummy para '{}': {}", name, e);
-            } else {
-                log::info!("Dummy criado: {:?}", dest);
+    // \documentclass[opts]{nome} → nome.cls
+    let mut offset = 0;
+    while let Some(pos) = tex[offset..].find("\\documentclass") {
+        offset += pos + "\\documentclass".len();
+        let rest = &tex[offset..];
+        // Pula opções opcionais [...]
+        let mut idx = rest.find('{').unwrap_or(0);
+        if rest.starts_with('[') {
+            idx = rest.find("]{").map(|p| p + 1).unwrap_or(idx);
+        }
+        if let Some(open) = rest[idx..].find('{') {
+            let after = idx + open + 1;
+            if let Some(close) = rest[after..].find('}') {
+                let cls = rest[after..after + close].trim();
+                if !cls.is_empty() && !cls.contains('\\') {
+                    refs.insert(format!("{}.cls", cls));
+                }
             }
         }
     }
+
+    refs.into_iter().collect()
 }
 
 /// Copia .cls, .sty, imagens e fontes de todos os pacotes salvos
 /// para o diretório de saída, onde o pdflatex vai procurá-los.
-/// Arquivos marcados como placeholder NÃO são copiados — assim o
-/// patchMissingImages os detecta como ausentes e os envolve em \phantom.
+/// Arquivos marcados como placeholder NÃO são copiados — o ensure_assets
+/// depois cria um dummy para eles.
 fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
     let tpl_dir = templates_dir();
     if !tpl_dir.exists() {
@@ -242,19 +349,6 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-
-/// Injeta redefinições de \cvevent, \cvdegree e \roundpic que verificam
-/// se o argumento de imagem está vazio antes de chamar \includegraphics.
-/// Isso evita "File '' not found" quando o placeholder está ativo.
-/// Substitui referências a imagens ausentes por \phantom{} ou argumento vazio.
-///
-/// Padrões tratados no simplehipstercv:
-///   \includegraphics[opts]{file}      → \phantom{\includegraphics[opts]{file}}
-///   \roundpic{file}                   → \roundpic{}
-///   \cvevent{}{}{}{}{texto}{file}     → \cvevent{}{}{}{}{texto}{}
-///   \cvdegree{}{}{}{}{}{file}         → \cvdegree{}{}{}{}{}{}
-///
-/// A regra: arquivo ausente no out_dir (tamanho <= 100 bytes) ou marcado
 /// Carrega o conjunto de filenames marcados como placeholder em qualquer template.
 fn load_placeholder_set() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
