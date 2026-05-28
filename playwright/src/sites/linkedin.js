@@ -3,60 +3,83 @@ import { humanDelay, humanClick, waitForVisible, uploadFile, randomBetween } fro
 import { checkCaptcha, handleCaptcha } from "../captcha.js";
 
 const uid = () => crypto.randomUUID().slice(0, 8);
-
 const BASE_URL = "https://www.linkedin.com";
 
 export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
-
   const encoded = encodeURIComponent(query);
   const url = `${BASE_URL}/jobs/search/?keywords=${encoded}&location=Brasil&f_TPR=r86400&sortBy=DD`;
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 });
-
-    // Aguarda carregamento real — importante para o Cloudflare
     await humanDelay(3000, 5000);
 
-    // Verifica se caiu no Cloudflare ou precisa de login
     const currentUrl = page.url();
-    if (currentUrl.includes("checkpoint") || currentUrl.includes("challenge")) {
-      emit("captcha_detected", { site: "linkedin", url: currentUrl });
-      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
+
+    // Authwall — pede login mas não é CAPTCHA; aguarda o usuário logar
+    if (currentUrl.includes("authwall") || currentUrl.includes("login") || currentUrl.includes("uas/login")) {
+      emit("progress", { message: "LinkedIn: faça login no navegador que abriu (aguardando até 3 min)..." });
+      try {
+        await page.waitForURL((u) => u.includes("linkedin.com/jobs"), { timeout: 180000 });
+        await humanDelay(2000, 3000);
+      } catch {
+        emit("progress", { message: "LinkedIn: login não detectado, pulando." });
         return jobs;
       }
-      emit("progress", { message: "LinkedIn: CAPTCHA resolvido. Retomando busca..." });
     }
 
-    if (currentUrl.includes("login") || currentUrl.includes("authwall")) {
-      emit("progress", { message: "LinkedIn: faça login manualmente no navegador que abriu" });
-      await page.waitForURL(/linkedin\.com\/jobs/, { timeout: 120000 }).catch(() => {});
+    // Checkpoint / challenge real (CAPTCHA)
+    if (page.url().includes("checkpoint") || page.url().includes("challenge")) {
+      emit("captcha_detected", { site: "linkedin", url: page.url() });
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
+      emit("progress", { message: "LinkedIn: CAPTCHA resolvido. Retomando busca..." });
     }
 
     if (await checkCaptcha(page)) {
       emit("captcha_detected", { site: "linkedin" });
-      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) {
-        return jobs;
-      }
-      emit("progress", { message: "LinkedIn: CAPTCHA resolvido. Retomando busca..." });
+      if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
     }
 
+    // Aguarda lista de vagas — seletores para usuário logado e guest
     await page.waitForSelector(
-      ".jobs-search-results__list, .jobs-search-results__list-item, .job-search-card, [data-occludable-job-id]",
+      [
+        ".jobs-search-results__list-item",
+        ".job-search-card",
+        "[data-occludable-job-id]",
+        ".base-card",
+        ".base-search-card",
+      ].join(", "),
       { timeout: 45000 }
     ).catch(() => {});
 
-    // Tenta extrair a lista de vagas diretamente do DOM
+    // Extrai cards — suporta DOM logado e DOM público
     const rawJobs = await page.$$eval(
-      'li.jobs-search-results__list-item, .job-search-card, [data-occludable-job-id]',
-      (cards) => cards.slice(0, 15).map((card) => {
-        const title = (card.querySelector('.job-search-card__title, .job-card-list__title, h3')?.textContent || "").trim();
-        const company = (card.querySelector('.job-search-card__company-name, .job-card-container__company-name, .job-card__company-name')?.textContent || "").trim();
-        const location = (card.querySelector('.job-search-card__location, .job-card-container__metadata-item, .job-card-list__location')?.textContent || "").trim();
-        const linkEl = card.querySelector('a.job-search-card__title-link, a.job-card-list__title--link, a[href*="/jobs/view/"]');
-        const link = linkEl instanceof HTMLAnchorElement ? linkEl.href : "";
-        return { title, company, location, link };
-      })
+      [
+        "li.jobs-search-results__list-item",
+        ".job-search-card",
+        "[data-occludable-job-id]",
+        ".base-card--link",
+      ].join(", "),
+      (cards) => {
+        const seen = new Set();
+        return cards.slice(0, 20).reduce((acc, card) => {
+          const title = (
+            card.querySelector(".job-search-card__title, .job-card-list__title, .base-search-card__title, h3") || {}
+          ).textContent?.trim() ?? "";
+          const company = (
+            card.querySelector(".job-search-card__company-name, .job-card-container__company-name, .base-search-card__subtitle, h4") || {}
+          ).textContent?.trim() ?? "";
+          const location = (
+            card.querySelector(".job-search-card__location, .job-card-container__metadata-item, .job-search-card__location") || {}
+          ).textContent?.trim() ?? "";
+          const linkEl = card.querySelector("a.job-search-card__title-link, a.job-card-list__title--link, a[href*='/jobs/view/'], a.base-card__full-link");
+          const link = linkEl?.href ?? "";
+          if (!title || !link || seen.has(link)) return acc;
+          seen.add(link);
+          acc.push({ title, company, location, link });
+          return acc;
+        }, []);
+      }
     ).catch(() => []);
 
     emit("progress", { message: `LinkedIn: ${rawJobs.length} cards extraídos` });
@@ -70,7 +93,6 @@ export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
       try {
         await detail.goto(link, { waitUntil: "domcontentloaded", timeout: 30000 });
         await humanDelay(1200, 2000);
-
         if (await checkCaptcha(detail)) {
           emit("captcha_detected", { site: "linkedin" });
           if (!stopOnCaptcha || !await handleCaptcha(detail, stopOnCaptcha)) {
@@ -78,7 +100,6 @@ export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
             continue;
           }
         }
-
         description = await detail.$eval(
           ".jobs-description__content, .description__text, #job-details, .show-more-less-html__markup",
           (el) => el.innerText.trim()
@@ -88,18 +109,9 @@ export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
         await detail.close();
       }
 
-      jobs.push({
-        id: `li-${uid()}`,
-        title,
-        company,
-        location,
-        url: link,
-        apply_url: link,
-        site: "linkedin",
-        description: description.slice(0, 3000),
-      });
-
-      emit("job_found", { title, company, site: "linkedin", location, id: jobs[jobs.length - 1].id, url: link, description });
+      const id = `li-${uid()}`;
+      jobs.push({ id, title, company, location, url: link, apply_url: link, site: "linkedin", description: description.slice(0, 3000) });
+      emit("job_found", { id, title, company, site: "linkedin", location, url: link, description: description.slice(0, 300) });
       await humanDelay(800, 1500);
     }
   } catch (err) {
@@ -111,76 +123,38 @@ export async function searchLinkedIn(page, query, emit, stopOnCaptcha = false) {
 
 export async function applyLinkedIn(page, pdfPath, coverLetter) {
   await humanDelay(1000, 2000);
-
-  // Botão "Candidatura simplificada" (Easy Apply)
   const easyApplyBtn = await page.$('[data-control-name="jobdetails_topcard_inapply"], .jobs-apply-button--top-card button');
-  if (!easyApplyBtn) {
-    return { success: false, reason: "Botão Easy Apply não encontrado — vaga redireciona para site externo" };
-  }
+  if (!easyApplyBtn) return { success: false, reason: "Botão Easy Apply não encontrado" };
 
   await humanClick(page, '[data-control-name="jobdetails_topcard_inapply"], .jobs-apply-button--top-card button');
   await humanDelay(1500, 2500);
+  if (await checkCaptcha(page)) return { success: false, captcha: true };
 
-  if (await checkCaptcha(page)) {
-    return { success: false, captcha: true };
-  }
-
-  // Fluxo multi-step do Easy Apply
   let step = 0;
   while (step < 10) {
     step++;
     await humanDelay(800, 1500);
-
-    // Upload de currículo se houver campo
     const uploadInput = await page.$('input[type="file"]');
-    if (uploadInput) {
-      await uploadFile(page, 'input[type="file"]', pdfPath);
-      await humanDelay(1000, 2000);
-    }
+    if (uploadInput) { await uploadFile(page, 'input[type="file"]', pdfPath); await humanDelay(1000, 2000); }
 
-    // Cover letter se houver textarea
     if (coverLetter) {
-      const textareas = await page.$$('textarea');
-      for (const ta of textareas) {
-        const placeholder = await ta.getAttribute("placeholder") ?? "";
-        if (placeholder.toLowerCase().includes("cover") ||
-            placeholder.toLowerCase().includes("carta") ||
-            placeholder.toLowerCase().includes("apresenta")) {
-          await ta.click();
-          await humanDelay(200, 400);
-          await ta.fill(coverLetter);
-          await humanDelay(400, 800);
+      for (const ta of await page.$$("textarea")) {
+        const ph = (await ta.getAttribute("placeholder") ?? "").toLowerCase();
+        if (ph.includes("cover") || ph.includes("carta") || ph.includes("apresenta")) {
+          await ta.click(); await humanDelay(200, 400); await ta.fill(coverLetter); await humanDelay(400, 800);
         }
       }
     }
+    if (await checkCaptcha(page)) return { success: false, captcha: true };
 
-    // Verifica CAPTCHA em cada passo
-    if (await checkCaptcha(page)) {
-      return { success: false, captcha: true };
-    }
-
-    // Botão de próximo passo ou submissão
-    const nextBtn = await page.$(
-      'button[aria-label="Continue to next step"], ' +
-      'button[aria-label="Submit application"], ' +
-      'button[aria-label="Review your application"], ' +
-      '.artdeco-button--primary'
-    );
-
+    const nextBtn = await page.$('button[aria-label="Continue to next step"], button[aria-label="Submit application"], button[aria-label="Review your application"], .artdeco-button--primary');
     if (!nextBtn) break;
-
     const btnText = (await nextBtn.innerText()).toLowerCase();
-    await humanClick(page, '.artdeco-button--primary');
+    await humanClick(page, ".artdeco-button--primary");
     await humanDelay(1000, 2000);
-
-    if (btnText.includes("submit") || btnText.includes("enviar")) {
-      // Candidatura enviada!
-      await humanDelay(2000, 3000);
-      return { success: true };
-    }
+    if (btnText.includes("submit") || btnText.includes("enviar")) { await humanDelay(2000, 3000); return { success: true }; }
   }
 
-  // Verifica se chegamos na tela de confirmação
-  const confirmed = await waitForVisible(page, '.jobs-post-apply-confirmation, [data-test-id="confirmation"]', 5000);
-  return { success: confirmed, reason: confirmed ? undefined : "Fluxo de candidatura incompleto" };
+  const confirmed = await waitForVisible(page, ".jobs-post-apply-confirmation, [data-test-id=\"confirmation\"]", 5000);
+  return { success: confirmed, reason: confirmed ? undefined : "Fluxo incompleto" };
 }
