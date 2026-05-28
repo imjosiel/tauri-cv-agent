@@ -1,11 +1,11 @@
 // playwright/src/latex.js
 import { mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync, readFileSync } from "fs";
-import { join, extname, delimiter } from "path";
+import { join, extname, delimiter, dirname, basename, parse as parsePath } from "path";
 import { execSync } from "child_process";
 
-const DATA_DIR    = join(process.env.APPDATA ?? process.env.HOME ?? ".", "cv-agent");
-const OUT_DIR     = join(DATA_DIR, "curriculo", "output");
-const TPL_DIR     = join(DATA_DIR, "curriculo", "templates");
+const DATA_DIR = join(process.env.APPDATA ?? process.env.HOME ?? ".", "cv-agent");
+const OUT_DIR  = join(DATA_DIR, "curriculo", "output");
+const TPL_DIR  = join(DATA_DIR, "curriculo", "templates");
 
 // ── Detecção do TinyTeX ───────────────────────────────────────────────────────
 
@@ -61,30 +61,180 @@ function buildEnv() {
   return env;
 }
 
-// ── Patch de imagens faltantes ────────────────────────────────────────────────
-// Espelha a função patch_missing_images do latex.rs.
-// Substitui \includegraphics{arquivo} por \phantom{\includegraphics{arquivo}}
-// quando o arquivo não existe no diretório de saída ou está marcado como placeholder.
+// ── Constantes ────────────────────────────────────────────────────────────────
+
+// PNG 1×1 transparente — mínimo válido que o pdflatex aceita
+const DUMMY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGIAAQAABQABDQottAAAAAAASUVORK5CYII=",
+  "base64"
+);
+
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"]);
+const STYLE_EXTS = new Set(["cls", "sty"]);
+
+// ── Placeholder set ───────────────────────────────────────────────────────────
 
 function loadPlaceholderSet() {
   const placeholders = new Set();
   if (!existsSync(TPL_DIR)) return placeholders;
-
   for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const metaPath = join(TPL_DIR, entry.name, "assets-meta.json");
     if (!existsSync(metaPath)) continue;
     try {
       const meta = JSON.parse(readFileSync(metaPath, "utf8"));
-      for (const f of meta.placeholder_assets ?? []) {
-        placeholders.add(f);
-      }
+      for (const f of meta.placeholder_assets ?? []) placeholders.add(f);
     } catch {}
   }
   return placeholders;
 }
 
-// ── Compilação ────────────────────────────────────────────────────────────────
+// ── Extração de referências de assets no .tex ─────────────────────────────────
+
+function collectAssetRefs(tex) {
+  const refs = new Set();
+  const allExts = new Set([...IMAGE_EXTS, ...STYLE_EXTS]);
+
+  // Varredura genérica: qualquer {nome.ext} com extensão conhecida
+  let i = 0;
+  while (i < tex.length) {
+    if (tex[i] === "{") {
+      const start = i + 1;
+      let j = start;
+      while (j < tex.length && tex[j] !== "}" && tex[j] !== "{" && tex[j] !== "\n") j++;
+      if (tex[j] === "}") {
+        const name = tex.slice(start, j).trim();
+        const ext  = name.split(".").pop()?.toLowerCase() ?? "";
+        if (allExts.has(ext) && !name.includes("\\") && name.length > 0) {
+          refs.add(name);
+        }
+      }
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+
+  // \documentclass[opts]{nome} → nome.cls
+  const dcRe = /\\documentclass(?:\[[^\]]*\])?\{([^}]+)\}/g;
+  for (const m of tex.matchAll(dcRe)) {
+    const cls = m[1].trim().split(",")[0].trim();
+    if (cls && !cls.includes("\\")) refs.add(`${cls}.cls`);
+  }
+
+  return refs;
+}
+
+// ── ensure_assets ─────────────────────────────────────────────────────────────
+// Garante que todo asset referenciado no .tex existe no jobDir antes da compilação.
+//
+// Três casos:
+// 1. Subpasta  — cria o diretório pai e o dummy dentro dele
+// 2. Extensão alternativa — se foto.png não existe mas foto.jpg sim, copia com o nome esperado
+// 3. .cls/.sty — cria stub mínimo em vez de dummy PNG
+
+function ensureAssets(tex, jobDir) {
+  const refs = collectAssetRefs(tex);
+
+  // Mapa stem → caminho real em jobDir (para resolução de extensão alternativa)
+  const existingByStem = new Map();
+  try {
+    for (const f of readdirSync(jobDir)) {
+      const { name, ext } = parsePath(f);
+      if (IMAGE_EXTS.has(ext.slice(1).toLowerCase())) {
+        existingByStem.set(name.toLowerCase(), join(jobDir, f));
+      }
+    }
+  } catch {}
+
+  for (const refPath of refs) {
+    const dest = join(jobDir, refPath);
+
+    // Já existe — ok
+    if (existsSync(dest)) continue;
+
+    const ext  = extname(refPath).slice(1).toLowerCase();
+    const stem = parsePath(refPath).name.toLowerCase();
+
+    // FIX 1: garante que o diretório pai existe (subpastas)
+    const parentDir = dirname(dest);
+    if (parentDir !== jobDir) {
+      try { mkdirSync(parentDir, { recursive: true }); } catch {}
+    }
+
+    if (IMAGE_EXTS.has(ext)) {
+      // FIX 2: extensão alternativa já disponível no jobDir
+      const alt = existingByStem.get(stem);
+      if (alt) {
+        console.log(`[latex] usando '${basename(alt)}' como substituto para '${refPath}'`);
+        try {
+          copyFileSync(alt, dest);
+          continue;
+        } catch (e) {
+          console.warn(`[latex] falha ao copiar alternativo: ${e.message}`);
+        }
+      }
+      // Cria dummy PNG (FIX 1 já criou o diretório pai)
+      try {
+        writeFileSync(dest, DUMMY_PNG);
+        console.log(`[latex] dummy PNG criado: ${refPath}`);
+      } catch (e) {
+        console.warn(`[latex] não foi possível criar dummy para '${refPath}': ${e.message}`);
+      }
+    } else if (STYLE_EXTS.has(ext)) {
+      // FIX 3: stub mínimo de .cls/.sty
+      const stub = ext === "cls"
+        ? "\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesClass{stub}[2024/01/01 auto-generated stub]\n\\LoadClass{article}\n"
+        : "% auto-generated stub\n";
+      try {
+        writeFileSync(dest, stub, "utf8");
+        console.log(`[latex] stub .${ext} criado: ${refPath}`);
+      } catch (e) {
+        console.warn(`[latex] não foi possível criar stub para '${refPath}': ${e.message}`);
+      }
+    }
+  }
+}
+
+// ── copyAssetsToOutput ────────────────────────────────────────────────────────
+
+function copyAssetsToOutput(jobDir) {
+  if (!existsSync(TPL_DIR)) return;
+
+  const supported = new Set([".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty", ".ttf", ".otf"]);
+  const placeholders = loadPlaceholderSet();
+  let count = 0;
+
+  function tryCopy(src, name) {
+    if (placeholders.has(name)) {
+      console.log(`[latex] pulando placeholder: ${name}`);
+      return;
+    }
+    try {
+      copyFileSync(src, join(jobDir, name));
+      count++;
+    } catch (e) {
+      console.warn(`[latex] falha ao copiar ${name}: ${e.message}`);
+    }
+  }
+
+  for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
+    const srcPath = join(TPL_DIR, entry.name);
+    if (entry.isDirectory()) {
+      for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
+        if (asset.isFile() && supported.has(extname(asset.name).toLowerCase())) {
+          tryCopy(join(srcPath, asset.name), asset.name);
+        }
+      }
+    } else if (entry.isFile() && supported.has(extname(entry.name).toLowerCase())) {
+      tryCopy(srcPath, entry.name);
+    }
+  }
+
+  console.log(`[latex] ${count} assets copiados para ${jobDir}`);
+}
+
+// ── compileLaTeX ──────────────────────────────────────────────────────────────
 
 export async function compileLaTeX(texContent, jobId) {
   const jobDir = join(OUT_DIR, jobId);
@@ -93,17 +243,19 @@ export async function compileLaTeX(texContent, jobId) {
   const texPath = join(jobDir, "curriculo.tex");
   const pdfPath = join(jobDir, "curriculo.pdf");
 
-  // Copia assets e escreve o .tex original sem modificações
+  // 1. Copia assets reais dos templates
   copyAssetsToOutput(jobDir);
+
+  // 2. Escreve o .tex
   writeFileSync(texPath, texContent, "utf8");
 
-  // Cria PNGs dummy (1x1 transparente) para imagens ausentes — funciona com qualquer template
-  createDummyImages(texContent, jobDir);
+  // 3. Garante que todo asset referenciado existe no jobDir
+  ensureAssets(texContent, jobDir);
 
   const env  = buildEnv();
   const opts = { timeout: 120_000, stdio: "pipe", env };
 
-  // 3. Tenta latexmk, fallback para pdflatex
+  // 4. Compila: latexmk → fallback pdflatex
   let compiled = false;
   try {
     execSync(
@@ -138,7 +290,7 @@ export async function compileLaTeX(texContent, jobId) {
             `na primeira compilação via interface.`,
           );
         }
-        console.warn(`[latex] Aviso na passagem 2: ${summary.slice(0, 200)}`);
+        console.warn(`[latex] aviso na passagem 2: ${summary.slice(0, 200)}`);
       }
     }
   }
@@ -148,89 +300,4 @@ export async function compileLaTeX(texContent, jobId) {
   }
 
   return pdfPath;
-}
-
-// PNG 1x1 transparente — mínimo válido que o pdflatex aceita
-const DUMMY_PNG = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGIAAQAABQABDQottAAAAAAASUVORK5CYII=",
-  "base64"
-);
-
-// Cria arquivos PNG dummy para toda imagem referenciada no .tex que não existe.
-// Funciona com qualquer template LaTeX — não depende de comandos específicos.
-function createDummyImages(tex, jobDir) {
-  const placeholders = loadPlaceholderSet();
-  const imageExts = new Set(["png", "jpg", "jpeg", "pdf", "eps", "svg", "gif"]);
-
-  // Extrai {arquivo.ext} de qualquer lugar no .tex
-  const found = new Set();
-  let i = 0;
-  while (i < tex.length) {
-    if (tex[i] === "{") {
-      const start = i + 1;
-      let j = start;
-      while (j < tex.length && tex[j] !== "}" && tex[j] !== "{" && tex[j] !== "\n") j++;
-      if (tex[j] === "}") {
-        const name = tex.slice(start, j).trim();
-        const ext  = name.split(".").pop()?.toLowerCase() ?? "";
-        if (imageExts.has(ext) && !name.includes("\\")) {
-          found.add(name);
-        }
-      }
-      i = j + 1;
-    } else {
-      i++;
-    }
-  }
-
-  for (const name of found) {
-    // Cria dummy mesmo para placeholders — o pdflatex precisa do arquivo no disco
-    // O "placeholder" significa apenas que o usuário não tem a imagem real,
-    // mas o dummy 1x1 garante que o pdflatex não quebre
-    const dest = join(jobDir, name);
-    if (!existsSync(dest)) {
-      try {
-        writeFileSync(dest, DUMMY_PNG);
-        console.log(`[latex] dummy criado: ${name}`);
-      } catch (e) {
-        console.warn(`[latex] não foi possível criar dummy para '${name}': ${e.message}`);
-      }
-    }
-  }
-}
-
-
-function copyAssetsToOutput(jobDir) {
-  if (!existsSync(TPL_DIR)) return;
-
-  const supported = new Set([".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".cls", ".sty", ".ttf", ".otf"]);
-  const placeholders = loadPlaceholderSet();
-  let count = 0;
-
-  function tryCopy(src, name) {
-    // Não copia placeholders — deixa o arquivo ausente para patchMissingImages agir
-    if (placeholders.has(name)) {
-      console.log(`[latex] Pulando placeholder: ${name}`);
-      return;
-    }
-    try {
-      copyFileSync(src, join(jobDir, name));
-      count++;
-    } catch (e) { console.warn(`[latex] Falha ao copiar ${name}: ${e.message}`); }
-  }
-
-  for (const entry of readdirSync(TPL_DIR, { withFileTypes: true })) {
-    const srcPath = join(TPL_DIR, entry.name);
-    if (entry.isDirectory()) {
-      for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
-        if (asset.isFile() && supported.has(extname(asset.name).toLowerCase())) {
-          tryCopy(join(srcPath, asset.name), asset.name);
-        }
-      }
-    } else if (entry.isFile() && supported.has(extname(entry.name).toLowerCase())) {
-      tryCopy(srcPath, entry.name);
-    }
-  }
-
-  console.log(`[latex] ${count} assets copiados para ${jobDir}`);
 }
