@@ -152,7 +152,7 @@ fn create_dummy_images(tex: &str, out_dir: &PathBuf) {
         0xAE,0x42,0x60,0x82,
     ];
 
-    let _placeholder_set = load_placeholder_set();
+    let placeholder_set = load_placeholder_set();
 
     // Extrai todos os nomes de arquivo referenciados no .tex
     // usando uma heurística simples: qualquer {palavra.ext} onde ext é imagem
@@ -204,7 +204,7 @@ fn copy_assets_to_output(out_dir: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let _placeholder_set = load_placeholder_set();
+    let placeholder_set = load_placeholder_set();
     let asset_exts = ["png", "jpg", "jpeg", "pdf", "eps", "svg", "cls", "sty", "ttf", "otf"];
     let mut copied = 0usize;
 
