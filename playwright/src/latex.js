@@ -91,35 +91,77 @@ function loadPlaceholderSet() {
 
 // ── Extração de referências de assets no .tex ─────────────────────────────────
 
+// Pacotes padrão do TeX Live — não criamos stub para eles
+const BUILTIN_PKGS = new Set([
+  "inputenc","fontenc","babel","geometry","graphicx","xcolor","hyperref",
+  "amsmath","amssymb","amsfonts","tikz","pgf","listings","verbatim",
+  "enumitem","fancyhdr","titlesec","parskip","microtype","booktabs",
+  "array","longtable","multirow","multicol","float","caption","subcaption",
+  "natbib","biblatex","csquotes","setspace","ragged2e","soul","ulem",
+  "fontawesome","fontawesome5","academicons","calc","etoolbox","ifthen",
+  "xparse","expl3","l3packages","lmodern","times","palatino","helvet",
+  "avant","courier","mathptmx","mathpazo","fourier","utopia","charter",
+  "libertine","sourcesanspro","sourcecodepro","raleway","roboto",
+  "opensans","cabin","lato","inconsolata",
+]);
+
 function collectAssetRefs(tex) {
   const refs = new Set();
-  const allExts = new Set([...IMAGE_EXTS, ...STYLE_EXTS]);
 
-  // Varredura genérica: qualquer {nome.ext} com extensão conhecida
-  let i = 0;
-  while (i < tex.length) {
-    if (tex[i] === "{") {
-      const start = i + 1;
-      let j = start;
-      while (j < tex.length && tex[j] !== "}" && tex[j] !== "{" && tex[j] !== "\n") j++;
-      if (tex[j] === "}") {
-        const name = tex.slice(start, j).trim();
-        const ext  = name.split(".").pop()?.toLowerCase() ?? "";
-        if (allExts.has(ext) && !name.includes("\\") && name.length > 0) {
-          refs.add(name);
-        }
-      }
-      i = j + 1;
-    } else {
+  // Extrai o último argumento obrigatório {...} de um comando,
+  // pulando opções [...] e argumentos extras antes do arquivo
+  function extractLastArg(str) {
+    let i = 0;
+    // Pula espaços e [...]
+    while (i < str.length && (str[i] === " " || str[i] === "\t" || str[i] === "[")) {
+      if (str[i] === "[") { while (i < str.length && str[i] !== "]") i++; }
       i++;
+    }
+    let last = "";
+    while (i < str.length && str[i] === "{") {
+      i++; // pula {
+      const start = i;
+      let depth = 1;
+      while (i < str.length && depth > 0) {
+        if (str[i] === "{") depth++;
+        else if (str[i] === "}") depth--;
+        if (depth > 0) i++;
+      }
+      last = str.slice(start, i).trim();
+      i++; // pula }
+      // Pula espaços entre grupos
+      while (i < str.length && (str[i] === " " || str[i] === "\t")) i++;
+    }
+    return last;
+  }
+
+  // Comandos que referenciam arquivos de imagem
+  for (const cmd of ["\\includegraphics", "\\includepdf", "\\roundpic", "\\pgfdeclareimage"]) {
+    let offset = 0;
+    while (true) {
+      const pos = tex.indexOf(cmd, offset);
+      if (pos === -1) break;
+      offset = pos + cmd.length;
+      const name = extractLastArg(tex.slice(offset));
+      if (name && !name.includes("\\") && !name.includes(" ")) {
+        // Se não tem extensão, assume .png (padrão do pdflatex)
+        refs.add(name.includes(".") ? name : `${name}.png`);
+      }
     }
   }
 
-  // \documentclass[opts]{nome} → nome.cls
-  const dcRe = /\\documentclass(?:\[[^\]]*\])?\{([^}]+)\}/g;
-  for (const m of tex.matchAll(dcRe)) {
+  // \documentclass[opts]{classe} → classe.cls
+  for (const m of tex.matchAll(/\\documentclass(?:\[[^\]]*\])?\{([^}]+)\}/g)) {
     const cls = m[1].trim().split(",")[0].trim();
     if (cls && !cls.includes("\\")) refs.add(`${cls}.cls`);
+  }
+
+  // \usepackage[opts]{pacote} → pacote.sty (só pacotes não-padrão)
+  for (const m of tex.matchAll(/\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}/g)) {
+    const pkg = m[1].trim().split(",")[0].trim();
+    if (pkg && !pkg.includes("\\") && !BUILTIN_PKGS.has(pkg)) {
+      refs.add(`${pkg}.sty`);
+    }
   }
 
   return refs;
