@@ -247,50 +247,136 @@ fn find_alt_ext(out_dir: &PathBuf, stem: &str, exts: &[&str]) -> Option<PathBuf>
     None
 }
 
-/// Extrai todos os nomes de asset referenciados no .tex.
-/// Cobre \includegraphics, \roundpic, \documentclass e referências genéricas {arquivo.ext}.
+/// Extrai os nomes de asset referenciados no .tex.
+///
+/// Em vez de varredura genérica (que confundia argumentos de comandos como
+/// `\phantom{X}` com nomes de arquivo), agora usamos apenas comandos explícitos
+/// que de fato referenciam arquivos:
+///   \includegraphics[opts]{arquivo}
+///   \includepdf[opts]{arquivo}
+///   \input{arquivo}  \include{arquivo}
+///   \documentclass[opts]{classe}
+///   \usepackage[opts]{pacote}        → pacote.sty
+///   \roundpic{w}{h}{arquivo}         (custom em alguns templates)
 fn collect_asset_refs(tex: &str) -> Vec<String> {
     let mut refs = std::collections::HashSet::new();
-    let all_exts: Vec<&str> = IMAGE_EXTS.iter().chain(STYLE_EXTS.iter()).copied().collect();
 
-    // Varredura genérica: qualquer {nome.ext} conhecido
-    let bytes = tex.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            i += 1;
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'}' && bytes[i] != b'{' && bytes[i] != b'\n' {
-                i += 1;
+    // Comandos cujo argumento obrigatório final é um arquivo de imagem
+    for cmd in &[
+        "\\includegraphics",
+        "\\includepdf",
+        "\\roundpic",
+        "\\pgfdeclareimage",
+    ] {
+        let mut offset = 0;
+        while let Some(pos) = tex[offset..].find(cmd) {
+            offset += pos + cmd.len();
+            let rest = &tex[offset..];
+            // Pula opções opcionais [...] e argumentos extras {...} antes do arquivo
+            // Para \roundpic{w}{h}{arquivo} precisamos do último argumento
+            let mut search_from = 0;
+            // Conta chaves abertas para pegar o último argumento
+            let mut depth = 0_usize;
+            let mut last_arg = String::new();
+            let chars: Vec<char> = rest.chars().collect();
+            let mut ci = 0;
+            // Pula espaços e [...]
+            while ci < chars.len() && (chars[ci].is_whitespace() || chars[ci] == '[') {
+                if chars[ci] == '[' {
+                    while ci < chars.len() && chars[ci] != ']' { ci += 1; }
+                }
+                ci += 1;
             }
-            if i < bytes.len() && bytes[i] == b'}' {
-                let name = tex[start..i].trim();
-                let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-                if all_exts.contains(&ext.as_str()) && !name.contains('\\') && !name.is_empty() {
-                    refs.insert(name.to_string());
+            // Lê todos os grupos {...}
+            while ci < chars.len() {
+                if chars[ci] == '{' {
+                    depth += 1;
+                    let start = ci + 1;
+                    ci += 1;
+                    while ci < chars.len() && !(chars[ci] == '}' && depth == 1) {
+                        if chars[ci] == '{' { depth += 1; }
+                        else if chars[ci] == '}' { depth -= 1; }
+                        ci += 1;
+                    }
+                    let arg: String = chars[start..ci].iter().collect();
+                    last_arg = arg.trim().to_string();
+                    depth = depth.saturating_sub(1);
+                    ci += 1;
+                    // Para \includegraphics o único grupo é o arquivo
+                    if *cmd != "\\roundpic" && *cmd != "\\pgfdeclareimage" {
+                        break;
+                    }
+                } else if chars[ci].is_whitespace() || chars[ci] == '[' {
+                    if chars[ci] == '[' {
+                        while ci < chars.len() && chars[ci] != ']' { ci += 1; }
+                    }
+                    ci += 1;
+                } else {
+                    break;
                 }
             }
-        } else {
-            i += 1;
+            let name = last_arg;
+            if !name.is_empty() && !name.contains('\\') && !name.contains(' ') {
+                // Garante extensão — se omitida, tenta .png (pdflatex default para \includegraphics)
+                if name.contains('.') {
+                    refs.insert(name);
+                } else {
+                    refs.insert(format!("{}.png", name));
+                }
+            }
         }
     }
 
-    // \documentclass[opts]{nome} → nome.cls
+    // \documentclass[opts]{classe} → classe.cls
     let mut offset = 0;
     while let Some(pos) = tex[offset..].find("\\documentclass") {
         offset += pos + "\\documentclass".len();
         let rest = &tex[offset..];
-        // Pula opções opcionais [...]
-        let mut idx = rest.find('{').unwrap_or(0);
-        if rest.starts_with('[') {
-            idx = rest.find("]{").map(|p| p + 1).unwrap_or(idx);
+        let mut idx = 0;
+        if rest.trim_start().starts_with('[') {
+            idx = rest.find("]{").map(|p| p + 1).unwrap_or(0);
         }
         if let Some(open) = rest[idx..].find('{') {
             let after = idx + open + 1;
             if let Some(close) = rest[after..].find('}') {
                 let cls = rest[after..after + close].trim();
-                if !cls.is_empty() && !cls.contains('\\') {
+                if !cls.is_empty() && !cls.contains('\\') && !cls.contains(',') {
                     refs.insert(format!("{}.cls", cls));
+                }
+            }
+        }
+    }
+
+    // \usepackage[opts]{pacote} → pacote.sty  (só para pacotes não-padrão)
+    // Ignora pacotes do TeX Live que sempre existem
+    const BUILTIN: &[&str] = &[
+        "inputenc","fontenc","babel","geometry","graphicx","xcolor","hyperref",
+        "amsmath","amssymb","amsfonts","tikz","pgf","listings","verbatim",
+        "enumitem","fancyhdr","titlesec","parskip","microtype","booktabs",
+        "array","longtable","multirow","multicol","float","caption","subcaption",
+        "natbib","biblatex","csquotes","setspace","ragged2e","soul","ulem",
+        "fontawesome","fontawesome5","academicons","calc","etoolbox","ifthen",
+        "xparse","expl3","l3packages","lmodern","times","palatino","helvet",
+        "avant","courier","mathptmx","mathpazo","fourier","utopia","charter",
+        "libertine","sourcesanspro","sourcecodepro","raleway","roboto",
+        "opensans","cabin","lato","inconsolata","DejaVuSans","DejaVuSerif",
+    ];
+    let mut offset = 0;
+    while let Some(pos) = tex[offset..].find("\\usepackage") {
+        offset += pos + "\\usepackage".len();
+        let rest = &tex[offset..];
+        let mut idx = 0;
+        if rest.trim_start().starts_with('[') {
+            idx = rest.find("]{").map(|p| p + 1).unwrap_or(0);
+        }
+        if let Some(open) = rest[idx..].find('{') {
+            let after = idx + open + 1;
+            if let Some(close) = rest[after..].find('}') {
+                let pkg = rest[after..after + close].trim();
+                if !pkg.is_empty() && !pkg.contains('\\') && !pkg.contains(',')
+                    && !BUILTIN.contains(&pkg)
+                {
+                    refs.insert(format!("{}.sty", pkg));
                 }
             }
         }
