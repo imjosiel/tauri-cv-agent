@@ -6,7 +6,6 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
   const encoded = encodeURIComponent(query);
   try {
-    // URL correta da Catho: query param "q", não path segment
     await page.goto(`https://www.catho.com.br/vagas/?q=${encoded}&periodo=1`, {
       waitUntil: "domcontentloaded", timeout: 30000
     });
@@ -17,33 +16,53 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
       if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
     }
 
-    // Aguarda cards
+    // Diagnóstico: mostra o título da página e primeiros 800 chars do body
+    const pageTitle = await page.title().catch(() => "");
+    const bodySnippet = await page.$eval("body", el => el.innerText.slice(0, 400)).catch(() => "");
+    emit("progress", { message: `Catho DEBUG título: "${pageTitle}" | body: ${bodySnippet.replace(/\n/g, " ")}` });
+
     await page.waitForSelector(
-      '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"]',
+      '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"], [class*="sc-"], li[class*="job"]',
       { timeout: 20000 }
     ).catch(() => {});
 
+    // Tenta seletores mais amplos
     const cards = await page.$$(
-      '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"], [class*="jobCard"]'
+      '[data-testid="job-card"], article[data-id], [class*="JobCard"], [class*="jobCard"], li[class*="job"]'
     );
     emit("progress", { message: `Catho: ${cards.length} cards encontrados` });
 
+    if (cards.length > 0) {
+      const firstHtml = await cards[0].evaluate(el => el.outerHTML).catch(() => "");
+      emit("progress", { message: `Catho DEBUG primeiro card: ${firstHtml.slice(0, 500)}` });
+    }
+
     for (const card of cards.slice(0, 15)) {
       try {
-        const title = await card.$eval(
-          'h2, [data-testid="job-title"], [class*="JobTitle"], [class*="title"]',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const company = await card.$eval(
-          '[data-testid="company-name"], [class*="CompanyName"], [class*="company"]',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const location = await card.$eval(
-          '[data-testid="location"], [class*="Location"], [class*="location"]',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const link = await card.$eval("a", (el) => el.href).catch(() => "");
-        if (!title || !link) continue;
+        const title = await card.evaluate(el => {
+          const sels = ['h2', 'h3', '[class*="title" i]', '[class*="Title"]', 'a'];
+          for (const s of sels) { const n = el.querySelector(s); if (n?.innerText?.trim()) return n.innerText.trim(); }
+          return "";
+        }).catch(() => "");
+
+        const company = await card.evaluate(el => {
+          const sels = ['[class*="company" i]', '[class*="Company"]', 'span'];
+          for (const s of sels) { const n = el.querySelector(s); if (n?.innerText?.trim()) return n.innerText.trim(); }
+          return "";
+        }).catch(() => "");
+
+        const location = await card.evaluate(el => {
+          const sels = ['[class*="location" i]', '[class*="Location"]', '[class*="city" i]'];
+          for (const s of sels) { const n = el.querySelector(s); if (n?.innerText?.trim()) return n.innerText.trim(); }
+          return "";
+        }).catch(() => "");
+
+        const link = await card.evaluate(el => {
+          const a = el.querySelector("a[href]");
+          return a?.href ?? "";
+        }).catch(() => "");
+
+        if (!title || !link) { emit("progress", { message: `Catho: card sem título="${title}" link="${link.slice(0,60)}"` }); continue; }
 
         let description = "";
         const det = await page.context().newPage();
@@ -51,7 +70,7 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
           await det.goto(link, { waitUntil: "domcontentloaded", timeout: 20000 });
           await humanDelay(800, 1500);
           description = await det.$eval(
-            '[data-testid="job-description"], [class*="Description"], [class*="description"], .job-description',
+            '[data-testid="job-description"], [class*="Description" i], [class*="description"], .job-description',
             (el) => el.innerText.trim()
           ).catch(() => "");
         } finally { await det.close(); }
@@ -59,7 +78,9 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
         const jobId = `ca-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         jobs.push({ id: jobId, title, company, location, url: link, apply_url: link, site: "catho", description: description.slice(0, 3000) });
         emit("job_found", { id: jobId, title, company, site: "catho", location, url: link, description: description.slice(0, 300) });
-      } catch {}
+      } catch (err) {
+        emit("progress", { message: `Catho: erro no card — ${err.message}` });
+      }
       await humanDelay(400, 800);
     }
   } catch (err) {
