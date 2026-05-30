@@ -6,7 +6,6 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
   const jobs = [];
   const encoded = encodeURIComponent(query);
   try {
-    // fromage=3 → últimos 3 dias; l=Brasil filtra localidade
     await page.goto(`https://br.indeed.com/jobs?q=${encoded}&l=Brasil&fromage=3`, {
       waitUntil: "domcontentloaded", timeout: 30000
     });
@@ -17,7 +16,6 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
       if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
     }
 
-    // Aguarda qualquer card aparecer
     await page.waitForSelector(
       '.job_seen_beacon, .resultContent, [data-testid="slider_item"], td.resultContent',
       { timeout: 20000 }
@@ -28,28 +26,89 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
     );
     emit("progress", { message: `Indeed: ${cards.length} cards encontrados` });
 
+    // Diagnóstico: loga o HTML do primeiro card para identificar seletores reais
+    if (cards.length > 0) {
+      const firstHtml = await cards[0].evaluate(el => el.outerHTML).catch(() => "");
+      emit("progress", { message: `Indeed DEBUG primeiro card (500 chars): ${firstHtml.slice(0, 500)}` });
+    }
+
     for (const card of cards.slice(0, 15)) {
       try {
-        const title = await card.$eval(
-          'h2.jobTitle span[title], h2.jobTitle span, [data-testid="jobsearch-JobInfoHeader-title"] span',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const company = await card.$eval(
-          '[data-testid="company-name"], .companyName, span.companyName',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const location = await card.$eval(
-          '[data-testid="text-location"], .companyLocation',
-          (el) => el.innerText.trim()
-        ).catch(() => "");
-        const link = await card.$eval(
-          'h2.jobTitle a, a.jcs-JobTitle',
-          (el) => el.href
-        ).catch(() => "");
+        // Tenta vários seletores de título progressivamente
+        const title = await card.evaluate(el => {
+          const selectors = [
+            'h2.jobTitle span[title]',
+            'h2.jobTitle span',
+            'h2 span[title]',
+            'h2 a span',
+            '[data-testid="jobsearch-JobInfoHeader-title"] span',
+            '[class*="jobTitle"] span',
+            '[class*="JobTitle"] span',
+            'h2',
+          ];
+          for (const sel of selectors) {
+            const node = el.querySelector(sel);
+            if (node && node.innerText.trim()) return node.innerText.trim();
+          }
+          return "";
+        }).catch(() => "");
 
-        if (!title || !link) continue;
+        const company = await card.evaluate(el => {
+          const selectors = [
+            '[data-testid="company-name"]',
+            '.companyName',
+            'span.companyName',
+            '[class*="companyName"]',
+            '[class*="company"]',
+          ];
+          for (const sel of selectors) {
+            const node = el.querySelector(sel);
+            if (node && node.innerText.trim()) return node.innerText.trim();
+          }
+          return "";
+        }).catch(() => "");
 
-        // Normaliza URL do Indeed
+        const location = await card.evaluate(el => {
+          const selectors = [
+            '[data-testid="text-location"]',
+            '.companyLocation',
+            '[class*="companyLocation"]',
+            '[class*="location"]',
+          ];
+          for (const sel of selectors) {
+            const node = el.querySelector(sel);
+            if (node && node.innerText.trim()) return node.innerText.trim();
+          }
+          return "";
+        }).catch(() => "");
+
+        // Tenta vários seletores de link
+        const link = await card.evaluate(el => {
+          const selectors = [
+            'h2.jobTitle a',
+            'a.jcs-JobTitle',
+            'h2 a',
+            '[class*="jobTitle"] a',
+            'a[data-jk]',
+            'a[id^="job_"]',
+            'a[href*="/rc/clk"]',
+            'a[href*="/pagead"]',
+            'a',
+          ];
+          for (const sel of selectors) {
+            const node = el.querySelector(sel);
+            if (node && node.href) return node.href;
+          }
+          return "";
+        }).catch(() => "");
+
+        if (!title && !link) {
+          emit("progress", { message: `Indeed: card sem título e sem link, pulando` });
+          continue;
+        }
+        if (!title) { emit("progress", { message: `Indeed: sem título (link=${link.slice(0,60)})` }); continue; }
+        if (!link)  { emit("progress", { message: `Indeed: sem link (título=${title})` }); continue; }
+
         const fullLink = link.startsWith("http") ? link : `https://br.indeed.com${link}`;
 
         let description = "";
@@ -58,7 +117,7 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
           await det.goto(fullLink, { waitUntil: "domcontentloaded", timeout: 20000 });
           await humanDelay(800, 1500);
           description = await det.$eval(
-            '#jobDescriptionText, [data-testid="jobsearch-JobComponent-description"]',
+            '#jobDescriptionText, [data-testid="jobsearch-JobComponent-description"], [class*="jobDescription"]',
             (el) => el.innerText.trim()
           ).catch(() => "");
         } finally { await det.close(); }
@@ -66,7 +125,9 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
         const jobId = `in-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         jobs.push({ id: jobId, title, company, location, url: fullLink, apply_url: fullLink, site: "indeed", description: description.slice(0, 3000) });
         emit("job_found", { id: jobId, title, company, site: "indeed", location, url: fullLink, description: description.slice(0, 300) });
-      } catch {}
+      } catch (err) {
+        emit("progress", { message: `Indeed: erro no card — ${err.message}` });
+      }
       await humanDelay(300, 700);
     }
   } catch (err) {
