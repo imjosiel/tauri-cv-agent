@@ -473,14 +473,19 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
 }
 
 fn run_latex(out_dir: &PathBuf) -> Result<bool> {
+    let pdf_path = out_dir.join("curriculo.pdf");
+
     // Tenta latexmk primeiro
     if let Ok(out) = Command::new(texlive::tex_command("latexmk"))
         .args(["-pdf", "-interaction=nonstopmode", "-halt-on-error", "curriculo.tex"])
         .current_dir(out_dir)
         .output()
     {
-        if out.status.success() { return Ok(true); }
-        log::warn!("latexmk falhou — tentando pdflatex direto");
+        if out.status.success() || pdf_path.exists() {
+            // PDF gerado — sucesso mesmo que latexmk reporte warnings como erro
+            return Ok(true);
+        }
+        log::warn!("latexmk falhou e PDF não gerado — tentando pdflatex direto");
     }
 
     // Fallback: pdflatex (duas passagens para referências cruzadas)
@@ -491,13 +496,20 @@ fn run_latex(out_dir: &PathBuf) -> Result<bool> {
             .output()
             .map_err(|_| anyhow!("pdflatex não encontrado. Verifique se o TinyTeX foi instalado."))?;
 
+        // Verifica o PDF — mais confiável que o código de saída
+        if pdf_path.exists() { return Ok(true); }
+
         if !out.status.success() {
-            let log = String::from_utf8_lossy(&out.stdout).to_string()
+            let log_text = String::from_utf8_lossy(&out.stdout).to_string()
                 + &String::from_utf8_lossy(&out.stderr);
-            let errors: Vec<&str> = log.lines()
+            let errors: Vec<&str> = log_text.lines()
                 .filter(|l| l.starts_with('!') || l.contains("Fatal"))
                 .take(5).collect();
-            let summary = if errors.is_empty() { log[..log.len().min(500)].to_string() } else { errors.join("\n") };
+            let summary = if errors.is_empty() {
+                log_text[..log_text.len().min(500)].to_string()
+            } else {
+                errors.join("\n")
+            };
             if pass == 2 {
                 return Err(anyhow!(
                     "Erro na compilação LaTeX:\n{}\n\nSe o pdflatex não foi encontrado, aguarde o cv-agent instalar o TinyTeX na primeira compilação via interface.",
