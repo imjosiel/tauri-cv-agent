@@ -417,11 +417,13 @@ export async function compileLaTeX(texContent, jobId) {
     const missing = new Set();
     for (const line of log.split("\n")) {
       if (!line.includes("not found")) continue;
-      // Padrão: File `nome' not found  (nome pode estar vazio)
-      const m = line.match(/File [`'\u2018]([^`'\u2018\u2019]*)['\u2019]/);
+      if (!line.includes("File") && !line.includes("file")) continue;
+      // Captura: LaTeX Error, pdftex.def Error e LaTeX Warning
+      const m = line.match(/File [`\u2018]([^`'\u2018\u2019]+)['\u2019]/);
       if (!m) continue;
       const name = m[1].trim();
-      if (name.length > 0) missing.add(name); // ignora nome vazio
+      // Ignora nome vazio ou comandos LaTeX (\end, etc.)
+      if (name.length > 0 && !name.startsWith("\\")) missing.add(name);
     }
     return missing;
   }
