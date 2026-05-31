@@ -238,6 +238,23 @@ function ensureAssets(tex, jobDir) {
   }
 }
 
+// ── patchSty: torna \cvevent e \cvdegree tolerantes a logo vazio ─────────────
+// Substitui \includegraphics[h]{#6} por uma versão condicional que não
+// tenta carregar arquivo quando o argumento está vazio.
+
+function patchStyForEmptyLogo(styContent) {
+  // Padrão a substituir no \cvevent e \cvdegree:
+  //   \raisebox{-0.7\height}{\includegraphics[height=1cm]{#6}}
+  //   \raisebox{-0.7\height}{\includegraphics[height=0.5cm]{#6}}
+  // Substitui por versão com \ifx check
+  return styContent
+    .replace(
+      /\\raisebox\{-0\.7\\height\}\{\\includegraphics\[height=([^\]]+)\]\{#6\}\}/g,
+      (_, h) =>
+        `\\raisebox{-0.7\\height}{\\ifx\\relax#6\\relax\\else\\includegraphics[height=${h}]{#6}\\fi}`
+    );
+}
+
 // ── copyAssetsToOutput ────────────────────────────────────────────────────────
 
 function copyAssetsToOutput(jobDir) {
@@ -265,11 +282,28 @@ function copyAssetsToOutput(jobDir) {
     if (entry.isDirectory()) {
       for (const asset of readdirSync(srcPath, { withFileTypes: true })) {
         if (asset.isFile() && supported.has(extname(asset.name).toLowerCase())) {
-          tryCopy(join(srcPath, asset.name), asset.name);
+          // .sty: aplica patch para logo vazio antes de copiar
+          if (extname(asset.name).toLowerCase() === ".sty") {
+            try {
+              const patched = patchStyForEmptyLogo(readFileSync(join(srcPath, asset.name), "utf8"));
+              writeFileSync(join(jobDir, asset.name), patched, "utf8");
+              count++;
+            } catch { tryCopy(join(srcPath, asset.name), asset.name); }
+          } else {
+            tryCopy(join(srcPath, asset.name), asset.name);
+          }
         }
       }
     } else if (entry.isFile() && supported.has(extname(entry.name).toLowerCase())) {
-      tryCopy(srcPath, entry.name);
+      if (extname(entry.name).toLowerCase() === ".sty") {
+        try {
+          const patched = patchStyForEmptyLogo(readFileSync(srcPath, "utf8"));
+          writeFileSync(join(jobDir, entry.name), patched, "utf8");
+          count++;
+        } catch { tryCopy(srcPath, entry.name); }
+      } else {
+        tryCopy(srcPath, entry.name);
+      }
     }
   }
 
@@ -301,8 +335,13 @@ export async function compileLaTeX(texContent, jobId) {
   // Ex: "! LaTeX Error: File `phantom' not found." → "phantom"
   function extractMissingFiles(log) {
     const missing = new Set();
-    for (const m of log.matchAll(/File [`']([^`'']+)['']\s+not found/gi)) {
-      missing.add(m[1].trim());
+    for (const line of log.split("\n")) {
+      if (!line.includes("not found")) continue;
+      // Padrão: File `nome' not found  (nome pode estar vazio)
+      const m = line.match(/File [`'\u2018]([^`'\u2018\u2019]*)['\u2019]/);
+      if (!m) continue;
+      const name = m[1].trim();
+      if (name.length > 0) missing.add(name); // ignora nome vazio
     }
     return missing;
   }
