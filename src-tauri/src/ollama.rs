@@ -87,6 +87,9 @@ REGRAS OBRIGATÓRIAS:
 - Adapte apenas: resumo/objetivo, ordem de habilidades, palavras-chave relevantes
 - NÃO invente experiências ou habilidades inexistentes
 - NÃO altere datas, empresas, cargos ou conquistas reais
+- PRESERVE o número exato de argumentos de cada comando customizado (\cvevent, \cvdegree, etc.)
+  Ex: \cvevent{{A}}{{B}}{{C}}{{D}}{{E}}{{F}} tem 6 args — mantenha exatamente 6
+  NUNCA omita argumentos — chaves desbalanceadas causam erro fatal de compilação
 
 FORMATO DA RESPOSTA — siga exatamente esta estrutura:
 
