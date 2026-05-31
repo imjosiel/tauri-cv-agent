@@ -107,27 +107,29 @@ fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
 /// Ex: "! LaTeX Error: File `phantom' not found." → ["phantom"]
 fn extract_missing_files(log: &str) -> Vec<String> {
     let mut missing = vec![];
-    // Padrão: File `nome' not found  ou  File 'nome' not found
-    let re_str = r"File [`']([^`'']+)['']\s+not found";
-    if let Ok(re) = regex::Regex::new(re_str) {
-        for cap in re.captures_iter(log) {
-            let name = cap[1].trim().to_string();
-            if !name.is_empty() {
-                missing.push(name);
-            }
-        }
-    } else {
-        // Fallback sem regex: busca manual
-        for line in log.lines() {
-            if line.contains("not found") && line.contains("File") {
-                if let Some(start) = line.find('`').or_else(|| line.find('\'')) {
-                    let rest = &line[start + 1..];
-                    if let Some(end) = rest.find('\'').or_else(|| rest.find(''')) {
-                        let name = rest[..end].trim().to_string();
-                        if !name.is_empty() {
+    // Padrão do pdflatex: ! LaTeX Error: File `nome' not found.
+    for line in log.lines() {
+        if line.contains("not found") && (line.contains("File") || line.contains("file")) {
+            // Tenta extrair entre backtick e aspas simples: `nome'
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '`' || chars[i] == '\u{2018}' {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < chars.len() && chars[j] != '\'' && chars[j] != '\u{2019}' && chars[j] != '`' {
+                        j += 1;
+                    }
+                    if j > start && j < chars.len() {
+                        let name: String = chars[start..j].iter().collect();
+                        let name = name.trim().to_string();
+                        if !name.is_empty() && !missing.contains(&name) {
                             missing.push(name);
                         }
                     }
+                    i = j + 1;
+                } else {
+                    i += 1;
                 }
             }
         }
