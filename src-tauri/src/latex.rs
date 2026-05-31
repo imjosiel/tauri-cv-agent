@@ -50,6 +50,68 @@ pub fn read_template(name: &str) -> Result<String> {
         .map_err(|e| anyhow!("Erro ao ler template '{}': {}", name, e))
 }
 
+
+/// Detecta usos de \cvevent ou \cvdegree fora de ambiente tabular e os envolve
+/// em \begin{tabular}{...} ... \end{tabular}.
+fn fix_cvevent_outside_tabular(tex: &str) -> String {
+    let cmds: &[(&str, &str)] = &[
+        ("\\cvevent",  "r|p{0.68\\textwidth}c"),
+        ("\\cvdegree", "r p{0.68\\textwidth} c"),
+    ];
+
+    fn in_tabular(tex: &str, pos: usize) -> bool {
+        let slice = &tex[..pos];
+        let opens  = slice.matches("\\begin{tabular}").count();
+        let closes = slice.matches("\\end{tabular}").count();
+        opens > closes
+    }
+
+    fn cmd_end(tex: &str, start: usize) -> usize {
+        let bytes = tex.as_bytes();
+        let mut i = start;
+        loop {
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') { i += 1; }
+            if i < bytes.len() && bytes[i] == b'[' {
+                while i < bytes.len() && bytes[i] != b']' { i += 1; }
+                i += 1; continue;
+            }
+            if i >= bytes.len() || bytes[i] != b'{' { break; }
+            let mut depth = 0usize; i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => { if depth == 0 { i += 1; break; } depth -= 1; }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        i
+    }
+
+    let mut result = tex.to_string();
+    for (cmd, fmt) in cmds {
+        let mut offset = 0usize;
+        loop {
+            let Some(rel) = result[offset..].find(cmd) else { break };
+            let pos = offset + rel;
+            let after = pos + cmd.len();
+            let next = result[after..].chars().next();
+            if !matches!(next, Some('{') | Some('[') | Some(' ') | Some('\n') | Some('\t')) {
+                offset = pos + 1; continue;
+            }
+            if in_tabular(&result, pos) { offset = pos + 1; continue; }
+            let end = cmd_end(&result, after);
+            let inner = result[pos..end].to_string();
+            let wrapped = format!("\\begin{{tabular}}{{{fmt}}}\n    {inner}\n\\end{{tabular}}");
+            result.replace_range(pos..end, &wrapped);
+            log::info!("fix_cvevent_outside_tabular: {} envolto em tabular", cmd);
+            offset = pos + wrapped.len();
+        }
+    }
+    result
+}
+
 /// Mapa de comandos customizados e número esperado de argumentos.
 const CUSTOM_CMD_ARGS: &[(&str, usize)] = &[
     ("cvevent",   6),
@@ -152,8 +214,10 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     // 2. Escreve o .tex
     std::fs::write(&tex_path, tex_content)?;
 
-    // 3. Corrige argumentos faltantes em comandos customizados (LLM omite o 6º arg)
-    let fixed_tex = fix_custom_command_args(tex_content);
+    // 3a. Envolve \cvevent/\cvdegree soltos em tabular
+    let fixed_tabular = fix_cvevent_outside_tabular(tex_content);
+    // 3b. Corrige argumentos faltantes
+    let fixed_tex = fix_custom_command_args(&fixed_tabular);
     let tex_to_compile = if fixed_tex != tex_content {
         log::info!("tex corrigido — args faltantes preenchidos em comandos customizados");
         std::fs::write(&tex_path, &fixed_tex)?;
@@ -493,7 +557,7 @@ fn collect_asset_refs(tex: &str) -> Vec<String> {
             let rest = &tex[offset..];
             // Pula opções opcionais [...] e argumentos extras {...} antes do arquivo
             // Para \roundpic{w}{h}{arquivo} precisamos do último argumento
-            let mut search_from = 0;
+            let mut _search_from = 0;
             // Conta chaves abertas para pegar o último argumento
             let mut depth = 0_usize;
             let mut last_arg = String::new();
