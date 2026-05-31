@@ -220,7 +220,18 @@ export async function applyIndeed(page, pdfPath, coverLetter) {
     '[data-testid="post-apply"], .ia-PostApply, [class*="PostApply"], ' +
     '[class*="confirmation"], [class*="success"]'
   ));
-  return confirmed
-    ? { success: true }
-    : { success: false, reason: "Fluxo Indeed não completado" };
+  if (confirmed) return { success: true };
+
+  // Debug: captura URL e HTML do formulário para diagnóstico
+  const currentUrl = await safe(() => applyPage.url()) ?? "";
+  const bodyText   = await safe(() => applyPage.evaluate(() => document.body?.innerText?.slice(0, 600))) ?? "";
+  const frameUrl   = frame !== applyPage ? (await safe(() => frame.url()) ?? "") : "";
+
+  // Emite diagnóstico via erro para aparecer nos logs
+  throw new Error(
+    `Fluxo Indeed não completado.\n` +
+    `URL: ${currentUrl}\n` +
+    `Frame URL: ${frameUrl}\n` +
+    `Body: ${bodyText.replace(/\n/g, " ").slice(0, 300)}`
+  );
 }
