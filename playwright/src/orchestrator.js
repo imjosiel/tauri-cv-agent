@@ -7,6 +7,7 @@ import { searchInfoJobs } from "./sites/infojobs.js";
 import { callOllama } from "./ollama.js";
 import { compileLaTeX } from "./latex.js";
 import { checkCaptcha, handleCaptcha } from "./captcha.js";
+import { isExternalATS, ensureVisionModel, runATSAgent } from "./ats-agent.js";
 
 const SITE_SEARCHERS = {
   linkedin: searchLinkedIn,
@@ -16,6 +17,7 @@ const SITE_SEARCHERS = {
 };
 
 export async function runSearch({ context, query, config, emit, log }) {
+  await ensureVisionModel(emit).catch(() => {});
   const { mode, min_score, max_per_night, delay_minutes, sites, blacklist,
           stop_on_captcha = false, modality = "any", locations = [] } = config;
 
@@ -134,7 +136,7 @@ export async function runSearch({ context, query, config, emit, log }) {
       const result = await submitApplication({
         page, job, pdfPath,
         coverLetter: config.cover_letter ? resumeResult.cover_letter : null,
-        stopOnCaptcha: stop_on_captcha, // FIX: agora passado corretamente
+        stopOnCaptcha: stop_on_captcha,
         emit,
         log,
       });
@@ -178,6 +180,13 @@ export async function runSearch({ context, query, config, emit, log }) {
 }
 
 // Detecta modalidade pelo texto da vaga
+function buildCandidateInfo(job) {
+  try {
+    const { readFileSync, readdirSync } = await import("fs").catch(() => ({}));
+    return `Vaga pretendida: ${job.title}\nEmpresa: ${job.company}`;
+  } catch { return `Vaga: ${job.title}`; }
+}
+
 function matchesModality(job, modality) {
   const text = `${job.title} ${job.description}`.toLowerCase();
   const remoteTerms  = ["remoto", "remote", "home office", "100% remoto", "trabalho remoto"];
@@ -230,6 +239,9 @@ async function submitApplication({ page, job, pdfPath, coverLetter, stopOnCaptch
       return await submitCatho(page, pdfPath, coverLetter);
     } else if (url.includes("infojobs.com")) {
       return await submitInfoJobs(page, pdfPath, coverLetter);
+    } else if (isExternalATS(url)) {
+      emit("progress", { message: `ATS externo detectado (${new URL(url).hostname}) — agente de visão` });
+      return runATSAgent({ page, pdfPath, candidateInfo: buildCandidateInfo(job), emit, jobTitle: job.title, company: job.company });
     } else {
       return { success: false, reason: `Site não suportado: ${url}` };
     }
