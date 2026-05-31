@@ -126,6 +126,9 @@ REGRAS OBRIGATÓRIAS:
 - Adapte apenas: resumo/objetivo, ordem de habilidades, palavras-chave relevantes
 - NÃO invente experiências ou habilidades inexistentes
 - NÃO altere datas, empresas, cargos ou conquistas reais
+- PRESERVE o número exato de argumentos de cada comando (\\cvevent, \\cvdegree, etc.)
+  Ex: se o original tem \\cvevent{A}{B}{C}{D}{E}{F} com 6 args, mantenha exatamente 6
+  NUNCA omita ou mescle argumentos — chaves desbalanceadas causam erro fatal
 
 FORMATO DA RESPOSTA — siga EXATAMENTE esta estrutura, sem desvios:
 
@@ -178,7 +181,97 @@ Responda agora seguindo exatamente o formato acima.`;
     );
   }
 
+  // Valida número de argumentos dos comandos customizados
+  const validated = validateCustomCommands(resumeTex, editedTex);
+  if (!validated.ok) {
+    console.warn(`[ollama] args inválidos: ${validated.errors.join("; ")} — restaurando comandos do original`);
+    return buildResult(raw, restoreCustomCommands(resumeTex, editedTex));
+  }
+
   return buildResult(raw, editedTex);
+}
+
+// ── Validação de argumentos de comandos customizados ─────────────────────────
+
+function countArgs(tex, offset) {
+  let count = 0, i = offset;
+  while (i < tex.length) {
+    while (i < tex.length && " \t\n".includes(tex[i])) i++;
+    if (tex[i] === "[") { while (i < tex.length && tex[i] !== "]") i++; i++; continue; }
+    if (tex[i] !== "{") break;
+    let depth = 0; i++;
+    while (i < tex.length) {
+      if (tex[i] === "{") depth++;
+      else if (tex[i] === "}") { if (depth === 0) { i++; break; } depth--; }
+      i++;
+    }
+    count++;
+  }
+  return count;
+}
+
+function extractCommandArgCounts(tex) {
+  const map = new Map();
+  for (const m of tex.matchAll(/\\([a-zA-Z]+)/g)) {
+    const count = countArgs(tex, m.index + m[0].length);
+    if (count >= 2) {
+      if (!map.has(m[1])) map.set(m[1], new Set());
+      map.get(m[1]).add(count);
+    }
+  }
+  return map;
+}
+
+function validateCustomCommands(originalTex, editedTex) {
+  const orig = extractCommandArgCounts(originalTex);
+  const edit = extractCommandArgCounts(editedTex);
+  const errors = [];
+  for (const [cmd, origSet] of orig) {
+    const editSet = edit.get(cmd);
+    if (!editSet) continue;
+    for (const n of origSet) {
+      if (!editSet.has(n)) errors.push(`\\${cmd} esperava ${n} args`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+function extractCommandUses(tex, cmdName) {
+  const uses = [], re = new RegExp(`\\\\${cmdName}(?=[\\s{\\[])`, "g");
+  for (const m of tex.matchAll(re)) {
+    let i = m.index + m[0].length;
+    while (i < tex.length) {
+      while (i < tex.length && " \t\n".includes(tex[i])) i++;
+      if (tex[i] === "[") { while (i < tex.length && tex[i] !== "]") i++; i++; continue; }
+      if (tex[i] !== "{") break;
+      let depth = 0; i++;
+      while (i < tex.length) {
+        if (tex[i] === "{") depth++;
+        else if (tex[i] === "}") { if (depth === 0) { i++; break; } depth--; }
+        i++;
+      }
+    }
+    uses.push({ start: m.index, end: i, full: tex.slice(m.index, i) });
+  }
+  return uses;
+}
+
+function restoreCustomCommands(originalTex, editedTex) {
+  let result = editedTex;
+  for (const cmd of ["cvevent", "cvdegree", "cvskill", "cvproject"]) {
+    const orig = extractCommandUses(originalTex, cmd);
+    const edit = extractCommandUses(result, cmd);
+    if (!orig.length) continue;
+    if (orig.length === edit.length) {
+      for (let i = orig.length - 1; i >= 0; i--)
+        result = result.slice(0, edit[i].start) + orig[i].full + result.slice(edit[i].end);
+    } else if (edit.length > 0) {
+      result = result.slice(0, edit[0].start)
+        + orig.map(u => u.full).join("\n    \\\\\n    ")
+        + result.slice(edit[edit.length - 1].end);
+    }
+  }
+  return result;
 }
 
 // Escapa caracteres especiais LaTeX que o LLM insere em texto livre.
