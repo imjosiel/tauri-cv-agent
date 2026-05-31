@@ -26,10 +26,8 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
     );
     emit("progress", { message: `Indeed: ${cards.length} cards encontrados` });
 
-    // Diagnóstico: loga o HTML do primeiro card para identificar seletores reais
     if (cards.length > 0) {
       const firstHtml = await cards[0].evaluate(el => el.outerHTML).catch(() => "");
-      emit("progress", { message: `Indeed DEBUG primeiro card (500 chars): ${firstHtml.slice(0, 500)}` });
     }
 
     for (const card of cards.slice(0, 15)) {
@@ -103,11 +101,10 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
         }).catch(() => "");
 
         if (!title && !link) {
-          emit("progress", { message: `Indeed: card sem título e sem link, pulando` });
           continue;
         }
-        if (!title) { emit("progress", { message: `Indeed: sem título (link=${link.slice(0,60)})` }); continue; }
-        if (!link)  { emit("progress", { message: `Indeed: sem link (título=${title})` }); continue; }
+        if (!title) continue;
+        if (!link)  continue;
 
         const fullLink = link.startsWith("http") ? link : `https://br.indeed.com${link}`;
 
