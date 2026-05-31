@@ -181,14 +181,65 @@ Responda agora seguindo exatamente o formato acima.`;
     );
   }
 
+  // Corrige \cvevent/\cvdegree fora de tabular
+  const tabularFixed = fixCveventOutsideTabular(editedTex);
+  const texToValidate = tabularFixed;
+
   // Valida número de argumentos dos comandos customizados
-  const validated = validateCustomCommands(resumeTex, editedTex);
+  const validated = validateCustomCommands(resumeTex, texToValidate);
   if (!validated.ok) {
     console.warn(`[ollama] args inválidos: ${validated.errors.join("; ")} — restaurando comandos do original`);
     return buildResult(raw, restoreCustomCommands(resumeTex, editedTex));
   }
 
-  return buildResult(raw, editedTex);
+  return buildResult(raw, texToValidate);
+}
+
+function fixCveventOutsideTabular(tex) {
+  const cmds = [
+    { name: "cvevent",  fmt: "r|p{0.68\\textwidth}c" },
+    { name: "cvdegree", fmt: "r p{0.68\\textwidth} c" },
+  ];
+  let result = tex;
+
+  function inTabular(t, pos) {
+    const sl = t.slice(0, pos);
+    return (sl.match(/\\begin\{tabular\}/g)||[]).length > (sl.match(/\\end\{tabular\}/g)||[]).length;
+  }
+
+  function getCmdEnd(t, i) {
+    while (i < t.length) {
+      while (i < t.length && " \t\n\r".includes(t[i])) i++;
+      if (t[i] === "[") { while (i < t.length && t[i] !== "]") i++; i++; continue; }
+      if (t[i] !== "{") break;
+      let depth = 0; i++;
+      while (i < t.length) {
+        if (t[i] === "{") depth++;
+        else if (t[i] === "}") { if (depth === 0) { i++; break; } depth--; }
+        i++;
+      }
+    }
+    return i;
+  }
+
+  for (const { name, fmt } of cmds) {
+    const needle = `\\${name}`;
+    let offset = 0;
+    while (true) {
+      const pos = result.indexOf(needle, offset);
+      if (pos === -1) break;
+      const after = pos + needle.length;
+      if (!/[{\[ \t\n]/.test(result[after] ?? "")) { offset = pos + 1; continue; }
+      if (inTabular(result, pos)) { offset = pos + 1; continue; }
+      const end = getCmdEnd(result, after);
+      const inner = result.slice(pos, end);
+      const wrapped = `\\begin{tabular}{${fmt}}\n    ${inner}\n\\end{tabular}`;
+      result = result.slice(0, pos) + wrapped + result.slice(end);
+      console.log(`[ollama] \\${name} fora de tabular — envolto`);
+      offset = pos + wrapped.length;
+    }
+  }
+  return result;
 }
 
 // ── Validação de argumentos de comandos customizados ─────────────────────────
