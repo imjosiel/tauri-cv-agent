@@ -135,12 +135,15 @@ export async function searchIndeed(page, query, emit, stopOnCaptcha = false) {
 
 export async function applyIndeed(page, pdfPath, coverLetter) {
   await humanDelay(1000, 2000);
-  if (await checkCaptcha(page)) return { success: false, captcha: true };
+  if (await checkCaptcha(page).catch(() => false)) return { success: false, captcha: true };
 
-  // Indeed tem dois fluxos: Easy Apply (iframe apply.indeed.com) e redirecionamento externo
-  // Tenta clicar no botão de candidatura com seletores atualizados
+  // Wrapper seguro: ignora erros de página fechada
+  async function safe(fn) {
+    try { return await fn(); } catch { return null; }
+  }
+
+  // Tenta clicar no botão de candidatura com seletores do Indeed BR 2025/2026
   const applySelectors = [
-    // Seletores atuais do Indeed BR (2025/2026)
     'button[data-testid="IndeedApplyButton"]',
     'button[data-testid="indeedApplyButton"]',
     'a[data-testid="IndeedApplyButton"]',
@@ -148,62 +151,75 @@ export async function applyIndeed(page, pdfPath, coverLetter) {
     '.jobsearch-IndeedApplyButton-newDesign',
     'button[class*="IndeedApply"]',
     'a[class*="IndeedApply"]',
-    // Fallback: qualquer botão/link com texto de candidatura
+    // Playwright locator por texto (mais robusto que seletor CSS)
+    'button:has-text("Candidatar-se")',
     'button:has-text("Candidatar")',
-    'button:has-text("Aplicar")',
+    'button:has-text("Aplicar agora")',
+    'a:has-text("Candidatar-se")',
     'a:has-text("Candidatar")',
-    'a:has-text("Aplicar agora")',
   ];
 
   let btn = null;
   for (const sel of applySelectors) {
-    btn = await page.$(sel).catch(() => null);
+    btn = await safe(() => page.$(sel));
     if (btn) break;
-  }
-
-  // Fallback: procura botão por texto
-  if (!btn) {
-    const buttons = await page.$$("button, a");
-    for (const b of buttons) {
-      const txt = (await b.innerText().catch(() => "")).toLowerCase();
-      if (txt.includes("candidatar") || txt.includes("aplicar") || txt.includes("apply")) {
-        btn = b; break;
-      }
-    }
   }
 
   if (!btn) return { success: false, reason: "Botão Indeed não encontrado" };
 
-  await btn.click();
+  await safe(() => btn.click());
   await humanDelay(2000, 3000);
 
-  // Verifica se abriu iframe do Indeed Apply
-  const frame = page.frames().find(f => f.url().includes("apply.indeed.com")) ?? page;
+  // Após clicar, o Indeed pode:
+  // 1. Abrir um iframe apply.indeed.com na mesma página
+  // 2. Redirecionar para apply.indeed.com
+  // 3. Abrir uma nova aba
+  // Tenta detectar qual fluxo foi aberto
+  let applyPage = page;
 
-  const uploadInput = await frame.$('input[type="file"]').catch(() => null);
-  if (uploadInput) await uploadFile(frame, 'input[type="file"]', pdfPath);
-  await humanDelay(800, 1500);
+  // Aguarda possível nova aba
+  const newPagePromise = page.context().waitForEvent("page", { timeout: 3000 }).catch(() => null);
+  const newTab = await newPagePromise;
+  if (newTab) {
+    await newTab.waitForLoadState("domcontentloaded").catch(() => {});
+    applyPage = newTab;
+  }
 
+  // Verifica iframe
+  const frame = applyPage.frames().find(f => f.url().includes("apply.indeed.com"))
+    ?? (applyPage.url().includes("apply.indeed.com") ? applyPage.mainFrame() : null)
+    ?? applyPage;
+
+  const uploadInput = await safe(() => frame.$('input[type="file"]'));
+  if (uploadInput) {
+    await safe(() => uploadFile(frame, 'input[type="file"]', pdfPath));
+    await humanDelay(800, 1500);
+  }
+
+  // Navega pelos passos do formulário
   for (let i = 0; i < 10; i++) {
-    if (await checkCaptcha(page)) return { success: false, captcha: true };
+    if (await safe(() => checkCaptcha(applyPage))) return { success: false, captcha: true };
 
-    const nextBtn = await frame.$(
+    const nextBtn = await safe(() => frame.$(
       'button[type="submit"], button.ia-continueButton, button.ia-submitButton, ' +
-      'button[data-testid="submit-button"], button[data-testid="continue-button"]'
-    ).catch(() => null);
+      'button[data-testid="submit-button"], button[data-testid="continue-button"], ' +
+      'button:has-text("Continuar"), button:has-text("Enviar"), button:has-text("Submit")'
+    ));
     if (!nextBtn) break;
 
-    const txt = (await nextBtn.innerText().catch(() => "")).toLowerCase();
-    await nextBtn.click();
+    const txt = (await safe(() => nextBtn.innerText()) ?? "").toLowerCase();
+    await safe(() => nextBtn.click());
     await humanDelay(1200, 2000);
     if (txt.includes("submit") || txt.includes("enviar") || txt.includes("confirmar")) {
       return { success: true };
     }
   }
 
-  // Verifica confirmação na página
-  const confirmed = await page.$('[data-testid="post-apply"], .ia-PostApply, [class*="PostApply"]')
-    .catch(() => null);
+  // Verifica confirmação
+  const confirmed = await safe(() => applyPage.$(
+    '[data-testid="post-apply"], .ia-PostApply, [class*="PostApply"], ' +
+    '[class*="confirmation"], [class*="success"]'
+  ));
   return confirmed
     ? { success: true }
     : { success: false, reason: "Fluxo Indeed não completado" };
