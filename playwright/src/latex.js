@@ -484,7 +484,13 @@ export async function compileLaTeX(texContent, jobId) {
     );
     compiled = true;
   } catch {
-    // latexmk não disponível ou falhou
+    // latexmk falhou — lê o .log do disco e cria dummies antes do pdflatex
+    const logPath = join(jobDir, "curriculo.log");
+    try {
+      const logContent = readFileSync(logPath, "utf8");
+      const created = createDummiesFromLog(logContent, jobDir);
+      if (created > 0) console.log(`[latex] latexmk falhou — ${created} dummies criados via .log`);
+    } catch {}
   }
 
   if (!compiled) {
