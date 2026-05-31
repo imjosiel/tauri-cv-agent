@@ -351,8 +351,9 @@ export async function compileLaTeX(texContent, jobId) {
     for (let pass = 1; pass <= 2; pass++) {
       try {
         execSync(`pdflatex -interaction=nonstopmode -halt-on-error -output-directory="${jobDir}" "${texPath}"`, opts);
-        compiled = true;
       } catch (err) {
+        // Verifica o PDF — mais confiável que o código de saída
+        if (existsSync(pdfPath)) { compiled = true; break; }
         const raw = (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? "");
         const errors = raw.split("\n").filter(l => l.startsWith("!") || l.includes("Fatal")).slice(0, 5).join("\n");
         if (pass === 2) {
@@ -361,7 +362,11 @@ export async function compileLaTeX(texContent, jobId) {
             `Se o pdflatex não foi encontrado, aguarde o cv-agent instalar o TinyTeX na primeira compilação via interface.`
           );
         }
+        continue;
       }
+      // Chegou aqui sem exceção — sucesso
+      compiled = true;
+      break;
     }
   }
 
