@@ -74,7 +74,9 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     //    Também resolve referências com subpasta e extensão alternativa.
     ensure_assets(tex_content, &out_dir);
 
-    let ok = try_latexmk(&out_dir).or_else(|_| try_pdflatex(&out_dir))?;
+    // Tenta latexmk primeiro; se falhar, usa pdflatex com retry para arquivos faltantes
+    let ok = try_latexmk(&out_dir).unwrap_or(false)
+        || try_pdflatex_with_retry(&out_dir)?;
 
     if !ok {
         return Err(anyhow!("Compilação LaTeX falhou sem mensagem de erro específica."));
@@ -99,6 +101,156 @@ fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
     }
 
     Ok(output.status.success())
+}
+
+/// Extrai nomes de arquivo faltantes do log do pdflatex.
+/// Ex: "! LaTeX Error: File `phantom' not found." → ["phantom"]
+fn extract_missing_files(log: &str) -> Vec<String> {
+    let mut missing = vec![];
+    // Padrão: File `nome' not found  ou  File 'nome' not found
+    let re_str = r"File [`']([^`'']+)['']\s+not found";
+    if let Ok(re) = regex::Regex::new(re_str) {
+        for cap in re.captures_iter(log) {
+            let name = cap[1].trim().to_string();
+            if !name.is_empty() {
+                missing.push(name);
+            }
+        }
+    } else {
+        // Fallback sem regex: busca manual
+        for line in log.lines() {
+            if line.contains("not found") && line.contains("File") {
+                if let Some(start) = line.find('`').or_else(|| line.find('\'')) {
+                    let rest = &line[start + 1..];
+                    if let Some(end) = rest.find('\'').or_else(|| rest.find(''')) {
+                        let name = rest[..end].trim().to_string();
+                        if !name.is_empty() {
+                            missing.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    missing
+}
+
+/// Cria dummies para arquivos faltantes reportados pelo pdflatex.
+fn create_dummies_from_log(log: &str, out_dir: &PathBuf) -> usize {
+    let missing = extract_missing_files(log);
+    let mut created = 0;
+
+    for name in &missing {
+        let ext = std::path::Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Sem extensão → cria .png (imagem) e .sty (pacote) — pdflatex tenta os dois
+        let targets: Vec<(String, &str)> = if ext.is_empty() {
+            vec![
+                (format!("{}.png", name), "image"),
+                (format!("{}.sty", name), "sty"),
+            ]
+        } else if ["png","jpg","jpeg","pdf","eps","svg","gif"].contains(&ext.as_str()) {
+            vec![(name.clone(), "image")]
+        } else if ext == "cls" {
+            vec![(name.clone(), "cls")]
+        } else {
+            vec![(name.clone(), "sty")]
+        };
+
+        for (file, kind) in targets {
+            let dest = out_dir.join(&file);
+            if dest.exists() { continue; }
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let result = match kind {
+                "image" => std::fs::write(&dest, DUMMY_PNG),
+                "cls"   => std::fs::write(&dest,
+                    "\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesClass{stub}[2024/01/01]\n\\LoadClass{article}\n"),
+                _       => std::fs::write(&dest, "% auto-generated stub\n"),
+            };
+            match result {
+                Ok(_) => {
+                    log::info!("dummy criado para arquivo faltante: {}", file);
+                    created += 1;
+                }
+                Err(e) => log::warn!("falha ao criar dummy para {}: {}", file, e),
+            }
+        }
+    }
+
+    created
+}
+
+fn run_pdflatex(out_dir: &PathBuf) -> std::result::Result<std::process::Output, std::io::Error> {
+    Command::new(texlive::tex_command("pdflatex"))
+        .args(["-interaction=nonstopmode", "-halt-on-error", "curriculo.tex"])
+        .current_dir(out_dir)
+        .output()
+}
+
+/// Compila com pdflatex; se houver arquivos faltantes, cria dummies e recompila.
+fn try_pdflatex_with_retry(out_dir: &PathBuf) -> Result<bool> {
+    // Passagem 1
+    let out1 = run_pdflatex(out_dir)
+        .map_err(|_| anyhow!("pdflatex não encontrado. Verifique se o TinyTeX foi instalado."))?;
+
+    if out1.status.success() {
+        // Segunda passagem para resolver referências cruzadas
+        let _ = run_pdflatex(out_dir);
+        return Ok(true);
+    }
+
+    let log1 = String::from_utf8_lossy(&out1.stdout).to_string()
+        + &String::from_utf8_lossy(&out1.stderr);
+
+    let missing = extract_missing_files(&log1);
+    if missing.is_empty() {
+        // Erro não relacionado a arquivo faltante — reporta
+        let lines: Vec<&str> = log1.lines()
+            .filter(|l| l.starts_with('!') || l.contains("Error") || l.contains("Fatal"))
+            .take(5)
+            .collect();
+        let summary = if lines.is_empty() { log1[..log1.len().min(500)].to_string() } else { lines.join("\n") };
+        return Err(anyhow!("Erro na compilação LaTeX:\n{}", summary));
+    }
+
+    // Cria dummies e recompila
+    let n = create_dummies_from_log(&log1, out_dir);
+    log::info!("{} dummies criados — recompilando...", n);
+
+    let out2 = run_pdflatex(out_dir)
+        .map_err(|_| anyhow!("pdflatex não encontrado."))?;
+
+    if out2.status.success() {
+        let _ = run_pdflatex(out_dir);
+        return Ok(true);
+    }
+
+    // Passagem 3: última tentativa
+    let log2 = String::from_utf8_lossy(&out2.stdout).to_string()
+        + &String::from_utf8_lossy(&out2.stderr);
+    create_dummies_from_log(&log2, out_dir);
+
+    let out3 = run_pdflatex(out_dir)
+        .map_err(|_| anyhow!("pdflatex não encontrado."))?;
+
+    if out3.status.success() {
+        return Ok(true);
+    }
+
+    let log3 = String::from_utf8_lossy(&out3.stdout).to_string()
+        + &String::from_utf8_lossy(&out3.stderr);
+    let lines: Vec<&str> = log3.lines()
+        .filter(|l| l.starts_with('!') || l.contains("Error") || l.contains("Fatal"))
+        .take(5)
+        .collect();
+    let summary = if lines.is_empty() { log3[..log3.len().min(500)].to_string() } else { lines.join("\n") };
+    Err(anyhow!("Erro na compilação LaTeX após retry:\n{}", summary))
 }
 
 fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
