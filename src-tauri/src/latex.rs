@@ -201,30 +201,35 @@ fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
 /// Ex: "! LaTeX Error: File `phantom' not found." → ["phantom"]
 fn extract_missing_files(log: &str) -> Vec<String> {
     let mut missing = vec![];
-    // Padrão do pdflatex: ! LaTeX Error: File `nome' not found.
+    // Captura dois padrões do pdflatex:
+    // 1. ! LaTeX Error: File `nome' not found.
+    // 2. ! Package pdftex.def Error: File `nome' not found: using draft setting.
+    // 3. LaTeX Warning: File `nome' not found on input line N.
     for line in log.lines() {
-        if line.contains("not found") && (line.contains("File") || line.contains("file")) {
-            // Tenta extrair entre backtick e aspas simples: `nome'
-            let chars: Vec<char> = line.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                if chars[i] == '`' || chars[i] == '\u{2018}' {
-                    let start = i + 1;
-                    let mut j = start;
-                    while j < chars.len() && chars[j] != '\'' && chars[j] != '\u{2019}' && chars[j] != '`' {
-                        j += 1;
-                    }
-                    if j > start && j < chars.len() {
-                        let name: String = chars[start..j].iter().collect();
-                        let name = name.trim().to_string();
-                        if !name.is_empty() && !missing.contains(&name) {
-                            missing.push(name);
-                        }
-                    }
-                    i = j + 1;
-                } else {
-                    i += 1;
+        if !line.contains("not found") { continue; }
+        if !line.contains("File") && !line.contains("file") { continue; }
+
+        // Extrai entre backtick (`) e aspas simples (')
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '`' || chars[i] == '\u{2018}' {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '\'' && chars[j] != '\u{2019}' && chars[j] != '`' {
+                    j += 1;
                 }
+                if j > start && j < chars.len() {
+                    let name: String = chars[start..j].iter().collect();
+                    let name = name.trim().to_string();
+                    // Ignora nomes vazios ou que começam com \ (comandos LaTeX)
+                    if !name.is_empty() && !name.starts_with('\\') && !missing.contains(&name) {
+                        missing.push(name);
+                    }
+                }
+                i = j + 1;
+            } else {
+                i += 1;
             }
         }
     }
@@ -349,41 +354,7 @@ fn try_pdflatex_with_retry(out_dir: &PathBuf) -> Result<bool> {
     Err(anyhow!("Erro na compilação LaTeX após retry:\n{}", summary))
 }
 
-fn try_pdflatex(out_dir: &PathBuf) -> Result<bool> {
-    for pass in 0..2 {
-        let output = Command::new(texlive::tex_command("pdflatex"))
-            .args(["-interaction=nonstopmode", "-halt-on-error", "curriculo.tex"])
-            .current_dir(out_dir)
-            .output()
-            .map_err(|_| anyhow!("pdflatex não encontrado. Verifique se o TinyTeX foi instalado corretamente."))?;
 
-        if !output.status.success() {
-            let detail = {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stdout.is_empty() { stdout.to_string() } else { stderr.to_string() }
-            };
-
-            log::error!("pdflatex (pass {}) falhou:\n{}", pass + 1, detail);
-
-            let error_lines: Vec<&str> = detail
-                .lines()
-                .filter(|l| l.starts_with('!') || l.contains("Error") || l.contains("Fatal"))
-                .take(5)
-                .collect();
-
-            let summary = if error_lines.is_empty() {
-                detail[..detail.len().min(500)].to_string()
-            } else {
-                error_lines.join("\n")
-            };
-
-            return Err(anyhow!("Erro na compilação LaTeX:\n{}", summary));
-        }
-    }
-
-    Ok(true)
-}
 
 // ── PNG 1×1 transparente ──────────────────────────────────────────────────────
 const DUMMY_PNG: &[u8] = &[
