@@ -255,7 +255,15 @@ fn try_latexmk(out_dir: &PathBuf) -> Result<bool> {
         .map_err(|e| anyhow!("latexmk não disponível: {}", e))?;
 
     if !output.status.success() {
-        log::warn!("latexmk falhou:\n{}", String::from_utf8_lossy(&output.stdout));
+        log::warn!("latexmk falhou — tentando criar dummies via curriculo.log");
+        // latexmk escreve o log do pdflatex em curriculo.log no disco
+        let log_path = out_dir.join("curriculo.log");
+        if let Ok(log_content) = std::fs::read_to_string(&log_path) {
+            let n = create_dummies_from_log(&log_content, out_dir);
+            if n > 0 {
+                log::info!("latexmk: {} dummies criados via curriculo.log", n);
+            }
+        }
     }
 
     Ok(output.status.success())
