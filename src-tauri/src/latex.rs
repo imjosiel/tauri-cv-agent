@@ -50,6 +50,90 @@ pub fn read_template(name: &str) -> Result<String> {
         .map_err(|e| anyhow!("Erro ao ler template '{}': {}", name, e))
 }
 
+/// Mapa de comandos customizados e número esperado de argumentos.
+const CUSTOM_CMD_ARGS: &[(&str, usize)] = &[
+    ("cvevent",   6),
+    ("cvdegree",  6),
+    ("cvskill",   2),
+    ("cvproject", 5),
+];
+
+/// Detecta usos de comandos customizados com menos argumentos que o esperado
+/// e preenche os args faltantes com {} vazio.
+/// Evita erros fatais como "File '\end' not found" causados por LLMs que omitem args.
+fn fix_custom_command_args(tex: &str) -> String {
+    let mut result = tex.to_string();
+
+    for (cmd_name, expected) in CUSTOM_CMD_ARGS {
+        let needle = format!("\\{}", cmd_name);
+        let mut search_from = 0;
+
+        loop {
+            let Some(pos) = result[search_from..].find(&needle) else { break };
+            let abs_pos = search_from + pos;
+            let after_cmd = abs_pos + needle.len();
+
+            // Verifica que é início de comando (não parte de outro nome)
+            let next = result[after_cmd..].chars().next();
+            if !matches!(next, Some('{') | Some('[') | Some(' ') | Some('\n') | Some('\t')) {
+                search_from = abs_pos + 1;
+                continue;
+            }
+
+            // Conta os grupos de argumentos
+            let mut groups: Vec<(usize, usize)> = vec![]; // (start, end) de cada grupo
+            let mut i = after_cmd;
+            let bytes = result.as_bytes();
+
+            loop {
+                // Pula espaços e newlines
+                while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+                    i += 1;
+                }
+                // Pula opções [...]
+                if i < bytes.len() && bytes[i] == b'[' {
+                    while i < bytes.len() && bytes[i] != b']' { i += 1; }
+                    i += 1;
+                    continue;
+                }
+                if i >= bytes.len() || bytes[i] != b'{' { break; }
+
+                let g_start = i;
+                let mut depth = 0usize;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            if depth == 0 { i += 1; break; }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                groups.push((g_start, i));
+            }
+
+            let missing = expected.saturating_sub(groups.len());
+            if missing > 0 && missing <= 3 {
+                let insert_at = groups.last().map(|g| g.1).unwrap_or(after_cmd);
+                let padding = "{}".repeat(missing);
+                result.insert_str(insert_at, &padding);
+                log::info!(
+                    "fix_custom_command_args: \\{} tinha {} args, esperava {} — inseridos {} arg(s) vazio(s)",
+                    cmd_name, groups.len(), expected, missing
+                );
+                search_from = insert_at + padding.len();
+            } else {
+                search_from = abs_pos + 1;
+            }
+        }
+    }
+
+    result
+}
+
 /// Compila um .tex em PDF.
 /// `app` recebe eventos de progresso durante a instalação do TinyTeX
 /// (ocorre apenas na primeira compilação, quando o TinyTeX ainda não está instalado).
@@ -68,11 +152,21 @@ pub async fn compile(tex_content: &str, job_id: &str, app: Option<&AppHandle>) -
     // 2. Escreve o .tex
     std::fs::write(&tex_path, tex_content)?;
 
-    // 3. Para cada referência de asset no .tex, garante que existe algo no out_dir:
+    // 3. Corrige argumentos faltantes em comandos customizados (LLM omite o 6º arg)
+    let fixed_tex = fix_custom_command_args(tex_content);
+    let tex_to_compile = if fixed_tex != tex_content {
+        log::info!("tex corrigido — args faltantes preenchidos em comandos customizados");
+        std::fs::write(&tex_path, &fixed_tex)?;
+        fixed_tex
+    } else {
+        tex_content.to_string()
+    };
+
+    // 4. Para cada referência de asset no .tex, garante que existe algo no out_dir:
     //    - imagem: cria PNG dummy 1×1 (não quebra o pdflatex, só fica em branco)
     //    - .cls/.sty: cria stub mínimo (evita "File not found" fatal)
     //    Também resolve referências com subpasta e extensão alternativa.
-    ensure_assets(tex_content, &out_dir);
+    ensure_assets(&tex_to_compile, &out_dir);
 
     // Tenta latexmk primeiro; se falhar, usa pdflatex com retry para arquivos faltantes
     let ok = try_latexmk(&out_dir).unwrap_or(false)
