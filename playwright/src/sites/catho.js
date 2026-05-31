@@ -16,10 +16,8 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
       if (!stopOnCaptcha || !await handleCaptcha(page, stopOnCaptcha)) return jobs;
     }
 
-    // Diagnóstico: mostra o título da página e primeiros 800 chars do body
     const pageTitle = await page.title().catch(() => "");
     const bodySnippet = await page.$eval("body", el => el.innerText.slice(0, 400)).catch(() => "");
-    emit("progress", { message: `Catho DEBUG título: "${pageTitle}" | body: ${bodySnippet.replace(/\n/g, " ")}` });
 
     await page.waitForSelector(
       '[data-testid="job-card"], article[data-id], [class*="JobCard_jobCard"], [class*="sc-"], li[class*="job"]',
@@ -34,7 +32,6 @@ export async function searchCatho(page, query, emit, stopOnCaptcha = false) {
 
     if (cards.length > 0) {
       const firstHtml = await cards[0].evaluate(el => el.outerHTML).catch(() => "");
-      emit("progress", { message: `Catho DEBUG primeiro card: ${firstHtml.slice(0, 500)}` });
     }
 
     for (const card of cards.slice(0, 15)) {
