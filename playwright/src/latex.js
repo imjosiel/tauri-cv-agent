@@ -310,6 +310,79 @@ function copyAssetsToOutput(jobDir) {
   console.log(`[latex] ${count} assets copiados para ${jobDir}`);
 }
 
+// ── fixCustomCommandArgs ─────────────────────────────────────────────────────
+// O LLM às vezes gera \cvevent ou \cvdegree com menos argumentos que o esperado.
+// Isso causa erros fatais como "File '\end' not found" porque o pdflatex
+// tenta consumir o próximo token como argumento faltante.
+//
+// Esta função varre o .tex, detecta usos de comandos conhecidos com args faltando,
+// e preenche os args ausentes com {} vazio.
+
+const KNOWN_ARG_COUNTS = {
+  cvevent: 6,
+  cvdegree: 6,
+  cvskill: 2,
+  cvproject: 5,
+};
+
+function fixCustomCommandArgs(tex) {
+  let result = tex;
+
+  for (const [cmdName, expectedArgs] of Object.entries(KNOWN_ARG_COUNTS)) {
+    const re = new RegExp(`\\\\${cmdName}(?=[\\s{\\[])`, "g");
+    let match;
+    let offset = 0;
+
+    while ((match = re.exec(result)) !== null) {
+      const cmdStart = match.index;
+      let i = cmdStart + match[0].length;
+
+      // Coleta os grupos {...} que seguem o comando
+      const groups = [];
+      while (i < result.length) {
+        // Pula espaços e newlines entre argumentos
+        while (i < result.length && /[ \t\n]/.test(result[i])) i++;
+
+        // Pula opções [...]
+        if (result[i] === "[") {
+          while (i < result.length && result[i] !== "]") i++;
+          i++; // pula ]
+          continue;
+        }
+
+        if (result[i] !== "{") break;
+
+        // Lê o grupo {...} completo
+        const gStart = i;
+        let depth = 0;
+        i++;
+        while (i < result.length) {
+          if (result[i] === "{") depth++;
+          else if (result[i] === "}") {
+            if (depth === 0) { i++; break; }
+            depth--;
+          }
+          i++;
+        }
+        groups.push({ start: gStart, end: i, content: result.slice(gStart, i) });
+      }
+
+      const missing = expectedArgs - groups.length;
+      if (missing > 0 && missing <= 3) {
+        // Insere {} vazios no ponto onde os argumentos terminaram
+        const insertAt = groups.length > 0 ? groups[groups.length - 1].end : cmdStart + match[0].length;
+        const padding = "{}".repeat(missing);
+        result = result.slice(0, insertAt) + padding + result.slice(insertAt);
+        console.log(`[latex] ${cmdName}: ${groups.length} args encontrados, esperava ${expectedArgs} — inseridos ${missing} arg(s) vazio(s)`);
+        // Reseta o regex para a posição após a correção
+        re.lastIndex = insertAt + padding.length;
+      }
+    }
+  }
+
+  return result;
+}
+
 // ── compileLaTeX ──────────────────────────────────────────────────────────────
 
 export async function compileLaTeX(texContent, jobId) {
@@ -325,8 +398,15 @@ export async function compileLaTeX(texContent, jobId) {
   // 2. Escreve o .tex
   writeFileSync(texPath, texContent, "utf8");
 
-  // 3. Garante que todo asset referenciado existe no jobDir
-  ensureAssets(texContent, jobDir);
+  // 3. Corrige args faltando em comandos customizados (LLM às vezes omite o 6º arg)
+  const fixedTex = fixCustomCommandArgs(texContent);
+  if (fixedTex !== texContent) {
+    writeFileSync(texPath, fixedTex, "utf8");
+    console.log("[latex] tex corrigido — args faltantes preenchidos");
+  }
+
+  // 4. Garante que todo asset referenciado existe no jobDir
+  ensureAssets(fixedTex, jobDir);
 
   const env  = buildEnv();
   const opts = { timeout: 120_000, stdio: "pipe", env };
@@ -393,7 +473,7 @@ export async function compileLaTeX(texContent, jobId) {
     );
   }
 
-  // 4. Compila: latexmk → fallback pdflatex com retry automático para arquivos faltantes
+  // 5. Compila: latexmk → fallback pdflatex com retry automático para arquivos faltantes
   let compiled = false;
   try {
     execSync(
