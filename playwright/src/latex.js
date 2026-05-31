@@ -297,7 +297,64 @@ export async function compileLaTeX(texContent, jobId) {
   const env  = buildEnv();
   const opts = { timeout: 120_000, stdio: "pipe", env };
 
-  // 4. Compila: latexmk → fallback pdflatex
+  // Extrai nomes de arquivo faltantes do log do pdflatex
+  // Ex: "! LaTeX Error: File `phantom' not found." → "phantom"
+  function extractMissingFiles(log) {
+    const missing = new Set();
+    for (const m of log.matchAll(/File [`']([^`'']+)['']\s+not found/gi)) {
+      missing.add(m[1].trim());
+    }
+    return missing;
+  }
+
+  function createDummiesFromLog(log, dir) {
+    const missing = extractMissingFiles(log);
+    let created = 0;
+    for (const name of missing) {
+      // Determina extensão: sem extensão → tenta .png (imagem) e .sty (pacote)
+      const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+      const targets = [];
+      if (!ext) {
+        // Pode ser imagem ou pacote — cria PNG dummy (pdflatex tenta como imagem primeiro)
+        targets.push({ file: `${name}.png`, type: "image" });
+        targets.push({ file: `${name}.sty`, type: "sty" });
+      } else if (["png","jpg","jpeg","pdf","eps","svg","gif"].includes(ext)) {
+        targets.push({ file: name, type: "image" });
+      } else if (["cls","sty"].includes(ext)) {
+        targets.push({ file: name, type: ext });
+      } else {
+        targets.push({ file: name, type: "image" });
+      }
+      for (const { file, type } of targets) {
+        const dest = join(dir, file);
+        if (existsSync(dest)) continue;
+        try {
+          mkdirSync(dirname(dest), { recursive: true });
+          if (type === "image") {
+            writeFileSync(dest, DUMMY_PNG);
+          } else if (type === "cls") {
+            writeFileSync(dest, "\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesClass{stub}[2024/01/01]\n\\LoadClass{article}\n", "utf8");
+          } else {
+            writeFileSync(dest, "% auto-generated stub\n", "utf8");
+          }
+          console.log(`[latex] dummy criado para arquivo faltante: ${file}`);
+          created++;
+        } catch (e) {
+          console.warn(`[latex] falha ao criar dummy para ${file}: ${e.message}`);
+        }
+      }
+    }
+    return created;
+  }
+
+  function runPdflatex() {
+    return execSync(
+      `pdflatex -interaction=nonstopmode -halt-on-error -output-directory="${jobDir}" "${texPath}"`,
+      opts,
+    );
+  }
+
+  // 4. Compila: latexmk → fallback pdflatex com retry automático para arquivos faltantes
   let compiled = false;
   try {
     execSync(
@@ -310,30 +367,44 @@ export async function compileLaTeX(texContent, jobId) {
   }
 
   if (!compiled) {
-    for (let pass = 1; pass <= 2; pass++) {
-      try {
-        execSync(
-          `pdflatex -interaction=nonstopmode -halt-on-error -output-directory="${jobDir}" "${texPath}"`,
-          opts,
-        );
-      } catch (err) {
-        const raw = (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? "") || String(err);
-        const errorLines = raw
-          .split("\n")
-          .filter((l) => l.startsWith("!") || l.includes("Error") || l.includes("Fatal"))
-          .slice(0, 6)
-          .join("\n");
-        const summary = errorLines || raw.slice(0, 1000);
-
-        if (pass === 1) {
-          throw new Error(
-            `Erro na compilação LaTeX (passagem ${pass}):\n${summary}\n\n` +
-            `Se o pdflatex não foi encontrado, aguarde o cv-agent instalar o TinyTeX ` +
-            `na primeira compilação via interface.`,
-          );
+    // Passagem 1: compila e captura erros de arquivo faltante
+    let pass1Log = "";
+    try {
+      runPdflatex();
+      compiled = true;
+    } catch (err) {
+      pass1Log = (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? "");
+      const missing = extractMissingFiles(pass1Log);
+      if (missing.size > 0) {
+        // Cria dummies para todos os arquivos faltantes e recompila
+        const created = createDummiesFromLog(pass1Log, jobDir);
+        console.log(`[latex] ${created} dummies criados — recompilando...`);
+        try {
+          runPdflatex();
+          compiled = true;
+        } catch (err2) {
+          // Passagem 3: última tentativa
+          const log2 = (err2.stdout?.toString() ?? "") + (err2.stderr?.toString() ?? "");
+          createDummiesFromLog(log2, jobDir);
+          try { runPdflatex(); compiled = true; } catch {}
         }
-        console.warn(`[latex] aviso na passagem 2: ${summary.slice(0, 200)}`);
       }
+    }
+
+    if (!compiled) {
+      // Relata o erro original
+      const raw = pass1Log || "";
+      const errorLines = raw
+        .split("\n")
+        .filter((l) => l.startsWith("!") || l.includes("Error") || l.includes("Fatal"))
+        .slice(0, 6)
+        .join("\n");
+      const summary = errorLines || raw.slice(0, 1000);
+      throw new Error(
+        `Erro na compilação LaTeX:\n${summary}\n\n` +
+        `Se o pdflatex não foi encontrado, aguarde o cv-agent instalar o TinyTeX ` +
+        `na primeira compilação via interface.`,
+      );
     }
   }
 
