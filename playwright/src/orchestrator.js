@@ -237,8 +237,24 @@ async function submitApplication({ page, job, pdfPath, coverLetter, stopOnCaptch
   try {
     if (url.includes("linkedin.com")) {
       return await submitLinkedIn(page, pdfPath, coverLetter);
+
     } else if (url.includes("indeed.com")) {
-      return await submitIndeed(page, pdfPath, coverLetter);
+      // Detecta se o Indeed redirecionou para a listagem em vez da vaga individual
+      // (acontece quando a vaga exige login ou foi removida)
+      const isJobPage = url.includes("/viewjob") || url.includes("/rc/clk") || url.includes("/pagead") || url.includes("jk=");
+      const isListing = url.includes("/jobs?") || url.includes("/jobs ");
+      if (isListing && !isJobPage) {
+        emit("progress", { message: "Indeed redirecionou para listagem — vaga pode exigir login. Tentando ATS agent." });
+        return runATSAgent({ page, pdfPath, candidateInfo: buildCandidateInfo(job), emit, jobTitle: job.title, company: job.company });
+      }
+      const indeedResult = await submitIndeed(page, pdfPath, coverLetter);
+      // Se falhou e a URL mudou para ATS externo, tenta o agente
+      if (!indeedResult.success && isExternalATS(page.url())) {
+        emit("progress", { message: `Indeed redirecionou para ATS externo (${new URL(page.url()).hostname}) — agente de visão` });
+        return runATSAgent({ page, pdfPath, candidateInfo: buildCandidateInfo(job), emit, jobTitle: job.title, company: job.company });
+      }
+      return indeedResult;
+
     } else if (url.includes("catho.com")) {
       return await submitCatho(page, pdfPath, coverLetter);
     } else if (url.includes("infojobs.com")) {
