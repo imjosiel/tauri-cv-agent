@@ -181,10 +181,14 @@ export async function runSearch({ context, query, config, emit, log }) {
 
 // Detecta modalidade pelo texto da vaga
 function buildCandidateInfo(job) {
-  try {
-    const { readFileSync, readdirSync } = await import("fs").catch(() => ({}));
-    return `Vaga pretendida: ${job.title}\nEmpresa: ${job.company}`;
-  } catch { return `Vaga: ${job.title}`; }
+  // Retorna informações básicas do candidato para o ATS agent
+  // O agente vai usar isso para preencher formulários
+  return [
+    `Vaga pretendida: ${job.title}`,
+    `Empresa: ${job.company}`,
+    `Localização: ${job.location ?? ""}`,
+    `Site de origem: ${job.site ?? ""}`,
+  ].filter(Boolean).join("\n");
 }
 
 function matchesModality(job, modality) {
